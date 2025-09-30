@@ -105,6 +105,16 @@
             </dependency>
             <dependency>
                 <groupId>org.apache.qpid</groupId>
+                <artifactId>qpid-broker-plugins-memory-store</artifactId>
+                <version>${qpid-protocol-plugin.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.qpid</groupId>
+                <artifactId>qpid-broker-plugins-management-http</artifactId>
+                <version>${qpid-protocol-plugin.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.qpid</groupId>
                 <artifactId>qpid-broker-core</artifactId>
                 <version>${qpid-protocol-plugin.version}</version>
                 <exclusions>

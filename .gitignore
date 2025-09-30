@@ -31,3 +31,4 @@ TAGS
 Vagrantfile.local
 /logs
 .DS_Store
+work/
