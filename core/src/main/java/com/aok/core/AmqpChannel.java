@@ -47,8 +47,6 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Getter
     private final int channelId;
 
-    private final VhostService vhostService;
-
     private final BindingService bindingService;
 
     private final ExchangeService exchangeService;
@@ -80,7 +78,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             if (ex.shouldCloseConnection()) {
                 connection.sendConnectionClose(errorCode, message, channelId);
             } else {
-                // by default close channel
+                //TODO by default close channel
 
             }
         } catch (Exception e) {
@@ -113,25 +111,27 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 log.info("delete exchange {} success", exchange);
             }
             connection.writeFrame(connection.getRegistry().createExchangeDeleteOkBody().generateFrame(channelId));
-        });;
+        });
     }
 
     @Override
     public void receiveExchangeBound(AMQShortString exchange, AMQShortString routingKey, AMQShortString queue) {
-        String exchangeName = exchange == null ? StringUtil.EMPTY_STRING : exchange.toString();
-        String queueName = queue == null ? StringUtil.EMPTY_STRING : queue.toString();
-        Exchange e = exchangeService.getExchange(connection.getVhost(), exchangeName);
-        Queue q = queueService.getQueue(connection.getVhost(), queueName);
-        if (e == null || q == null) {
+        process(() -> {
+            String exchangeName = exchange == null ? StringUtil.EMPTY_STRING : exchange.toString();
+            String queueName = queue == null ? StringUtil.EMPTY_STRING : queue.toString();
+            Exchange e = exchangeService.getExchange(connection.getVhost(), exchangeName);
+            Queue q = queueService.getQueue(connection.getVhost(), queueName);
+            if (e == null || q == null) {
+                ExchangeBoundOkBody exchangeBoundOkBody = connection.getRegistry()
+                        .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, AMQShortString.validValueOf("Exchange or Queue not found"));
+                connection.writeFrame(exchangeBoundOkBody.generateFrame(channelId));
+                return;
+            }
+            bindingService.bind(AMQShortString.toString(exchange), AMQShortString.toString(queue), AMQShortString.toString(routingKey));
             ExchangeBoundOkBody exchangeBoundOkBody = connection.getRegistry()
-                .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, AMQShortString.validValueOf("Exchange or Queue not found"));
+                    .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, null);
             connection.writeFrame(exchangeBoundOkBody.generateFrame(channelId));
-            return;
-        }
-        bindingService.bind(AMQShortString.toString(exchange), AMQShortString.toString(queue), AMQShortString.toString(routingKey));
-        ExchangeBoundOkBody exchangeBoundOkBody = connection.getRegistry()
-            .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, null);
-        connection.writeFrame(exchangeBoundOkBody.generateFrame(channelId));
+        });
     }
 
     @Override
@@ -174,12 +174,14 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveQueueBind(AMQShortString queue, AMQShortString exchange, AMQShortString bindingKey, boolean nowait, FieldTable arguments) {
-        connection.writeFrame(connection.getRegistry().createQueueBindOkBody().generateFrame(channelId));
+        process(() -> connection.writeFrame(connection.getRegistry().createQueueBindOkBody().generateFrame(channelId)));
     }
 
     @Override
     public void receiveQueuePurge(AMQShortString queue, boolean nowait) {
+        process(() -> {
 
+        });
     }
 
     @Override
@@ -197,25 +199,29 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveQueueUnbind(AMQShortString queue, AMQShortString exchange, AMQShortString bindingKey, FieldTable arguments) {
-        final QueueUnbindOkBody responseBody = connection.getRegistry().createQueueUnbindOkBody();
-        connection.writeFrame(responseBody.generateFrame(channelId));
+        process(() -> {
+            final QueueUnbindOkBody responseBody = connection.getRegistry().createQueueUnbindOkBody();
+            connection.writeFrame(responseBody.generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveBasicRecover(boolean requeue, boolean sync) {
-        connection.writeFrame(connection.getRegistry().createBasicRecoverSyncOkBody().generateFrame(channelId));
+        process(() -> connection.writeFrame(connection.getRegistry().createBasicRecoverSyncOkBody().generateFrame(channelId)));
     }
 
     @Override
     public void receiveBasicQos(long prefetchSize, int prefetchCount, boolean global) {
-        connection.writeFrame(connection.getRegistry().createBasicQosOkBody().generateFrame(channelId));
+        process(() -> connection.writeFrame(connection.getRegistry().createBasicQosOkBody().generateFrame(channelId)));
     }
 
     @Override
     public void receiveBasicConsume(AMQShortString queue, AMQShortString consumerTag, boolean noLocal, boolean noAck, boolean exclusive, boolean nowait, FieldTable arguments) {
-        final AMQMethodBody responseBody = connection.getRegistry().createBasicConsumeOkBody(
-            AMQShortString.createAMQShortString("ctag"));
-        connection.writeFrame(responseBody.generateFrame(channelId));
+        process(() -> {
+            final AMQMethodBody responseBody = connection.getRegistry().createBasicConsumeOkBody(
+                AMQShortString.createAMQShortString("ctag"));
+            connection.writeFrame(responseBody.generateFrame(channelId));
+        });
     }
 
     @Override
