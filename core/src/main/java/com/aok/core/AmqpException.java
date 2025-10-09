@@ -28,7 +28,6 @@ public class AmqpException extends RuntimeException {
         public static final int PRECONDITION_FAILED = 406;
         public static final int NOT_FOUND = 404;
         public static final int INTERNAL_ERROR = 500;
-        // ...可扩展更多错误码
     }
 }
 
