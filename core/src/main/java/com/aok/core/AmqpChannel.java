@@ -71,6 +71,24 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         this.bindingService = bindingService;
     }
 
+    private void process(Runnable action) {
+        try {
+            action.run();
+        } catch (AmqpException ex) {
+            int errorCode = ex.getErrorCode();
+            String message = ex.getMessage();
+            if (ex.shouldCloseConnection()) {
+                connection.sendConnectionClose(errorCode, message, channelId);
+            } else {
+                //TODO by default close channel
+
+            }
+        } catch (Exception e) {
+            log.error("channel {} process exception {}", channelId, e);
+            connection.sendConnectionClose(AmqpException.Codes.INTERNAL_ERROR, e.getMessage(), channelId);
+        }
+    }
+
     @Override
     public void receiveAccessRequest(AMQShortString realm, boolean exclusive, boolean passive, boolean active, boolean write, boolean read) {
         AccessRequestOkBody response = connection.getRegistry().createAccessRequestOkBody(0);
@@ -87,79 +105,125 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveExchangeDelete(AMQShortString exchange, boolean ifUnused, boolean nowait) {
-        String vhost = connection.getVhost();
-        Exchange cur = exchangeService.getExchange(vhost, AMQShortString.toString(exchange));
-        if (cur != null) {
-            exchangeService.deleteExchange(cur);
-            log.info("delete exchange {} success", exchange);
-        }
-        connection.writeFrame(connection.getRegistry().createExchangeDeleteOkBody().generateFrame(channelId));
+        process(() -> {
+            String vhost = connection.getVhost();
+            Exchange cur = exchangeService.getExchange(vhost, AMQShortString.toString(exchange));
+            if (cur != null) {
+                exchangeService.deleteExchange(cur);
+                log.info("delete exchange {} success", exchange);
+            }
+            connection.writeFrame(connection.getRegistry().createExchangeDeleteOkBody().generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveExchangeBound(AMQShortString exchange, AMQShortString routingKey, AMQShortString queue) {
-        ExchangeBoundOkBody exchangeBoundOkBody = connection.getRegistry()
-            .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, AMQShortString.validValueOf(""));
-        connection.writeFrame(exchangeBoundOkBody.generateFrame(channelId));
+        process(() -> {
+            String exchangeName = exchange == null ? StringUtil.EMPTY_STRING : exchange.toString();
+            String queueName = queue == null ? StringUtil.EMPTY_STRING : queue.toString();
+            Exchange e = exchangeService.getExchange(connection.getVhost(), exchangeName);
+            Queue q = queueService.getQueue(connection.getVhost(), queueName);
+            if (e == null || q == null) {
+                ExchangeBoundOkBody exchangeBoundOkBody = connection.getRegistry()
+                        .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, AMQShortString.validValueOf("Exchange or Queue not found"));
+                connection.writeFrame(exchangeBoundOkBody.generateFrame(channelId));
+                return;
+            }
+            bindingService.bind(AMQShortString.toString(exchange), AMQShortString.toString(queue), AMQShortString.toString(routingKey));
+            ExchangeBoundOkBody exchangeBoundOkBody = connection.getRegistry()
+                    .createExchangeBoundOkBody(ExchangeBoundOkBody.OK, null);
+            connection.writeFrame(exchangeBoundOkBody.generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveQueueDeclare(AMQShortString queue, boolean passive, boolean durable, boolean exclusive, boolean autoDelete, boolean nowait, FieldTable arguments) {
-        Queue q = queueService.addQueue(
-            connection.getVhost(),
-            AMQShortString.toString(queue),
-            exclusive,
-            autoDelete,
-            durable,
-            FieldTable.convertToMap(arguments)
-        );
-        log.info("queue declare success: {}", q);
-        QueueDeclareOkBody responseBody = connection.getRegistry().createQueueDeclareOkBody(AMQShortString.createAMQShortString(q.getName()), 0,0);
-        connection.writeFrame(responseBody.generateFrame(channelId));
+        process(() -> {
+            Queue cur = queueService.getQueue(connection.getVhost(), queue.toString());
+            if (cur != null) {
+                if (passive) {
+                    QueueDeclareOkBody responseBody = connection.getRegistry().createQueueDeclareOkBody(AMQShortString.createAMQShortString(cur.getName()), 0,0);
+                    connection.writeFrame(responseBody.generateFrame(channelId));
+                    return;
+                } else {
+                    if (cur.getDurable() != durable) {
+                        throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, "Queue already exist with different durable", true);
+                    }
+                    if (cur.getAutoDelete() != autoDelete) {
+                        throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, "Queue already exist with different autoDelete", true);
+                    }
+                    if (cur.getExclusive() != exclusive) {
+                        throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, "Queue already exist with different exclusive", true);
+                    }
+                    QueueDeclareOkBody responseBody = connection.getRegistry().createQueueDeclareOkBody(AMQShortString.createAMQShortString(cur.getName()), 0,0);
+                    connection.writeFrame(responseBody.generateFrame(channelId));
+                    return;
+                }
+            }
+            Queue q = queueService.addQueue(
+                connection.getVhost(),
+                AMQShortString.toString(queue),
+                exclusive,
+                autoDelete,
+                durable,
+                FieldTable.convertToMap(arguments)
+            );
+            log.info("queue declare success: {}", q);
+            QueueDeclareOkBody responseBody = connection.getRegistry().createQueueDeclareOkBody(AMQShortString.createAMQShortString(q.getName()), 0,0);
+            connection.writeFrame(responseBody.generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveQueueBind(AMQShortString queue, AMQShortString exchange, AMQShortString bindingKey, boolean nowait, FieldTable arguments) {
-        connection.writeFrame(connection.getRegistry().createQueueBindOkBody().generateFrame(channelId));
+        process(() -> connection.writeFrame(connection.getRegistry().createQueueBindOkBody().generateFrame(channelId)));
     }
 
     @Override
     public void receiveQueuePurge(AMQShortString queue, boolean nowait) {
+        process(() -> {
 
+        });
     }
 
     @Override
     public void receiveQueueDelete(AMQShortString queue, boolean ifUnused, boolean ifEmpty, boolean nowait) {
-        String vhost = connection.getVhost();
-        Queue cur = queueService.getQueue(vhost, AMQShortString.toString(queue));
-        if (cur != null) {
-            queueService.deleteQueue(cur);
-            log.info("delete queue {} success", queue);
-        }
-        connection.writeFrame(connection.getRegistry().createQueueDeleteOkBody(0).generateFrame(channelId));
+        process(() -> {
+            String vhost = connection.getVhost();
+            Queue cur = queueService.getQueue(vhost, AMQShortString.toString(queue));
+            if (cur != null) {
+                queueService.deleteQueue(cur);
+                log.info("delete queue {} success", queue);
+            }
+            connection.writeFrame(connection.getRegistry().createQueueDeleteOkBody(0).generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveQueueUnbind(AMQShortString queue, AMQShortString exchange, AMQShortString bindingKey, FieldTable arguments) {
-        final QueueUnbindOkBody responseBody = connection.getRegistry().createQueueUnbindOkBody();
-        connection.writeFrame(responseBody.generateFrame(channelId));
+        process(() -> {
+            final QueueUnbindOkBody responseBody = connection.getRegistry().createQueueUnbindOkBody();
+            connection.writeFrame(responseBody.generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveBasicRecover(boolean requeue, boolean sync) {
-        connection.writeFrame(connection.getRegistry().createBasicRecoverSyncOkBody().generateFrame(channelId));
+        process(() -> connection.writeFrame(connection.getRegistry().createBasicRecoverSyncOkBody().generateFrame(channelId)));
     }
 
     @Override
     public void receiveBasicQos(long prefetchSize, int prefetchCount, boolean global) {
-        connection.writeFrame(connection.getRegistry().createBasicQosOkBody().generateFrame(channelId));
+        process(() -> connection.writeFrame(connection.getRegistry().createBasicQosOkBody().generateFrame(channelId)));
     }
 
     @Override
     public void receiveBasicConsume(AMQShortString queue, AMQShortString consumerTag, boolean noLocal, boolean noAck, boolean exclusive, boolean nowait, FieldTable arguments) {
-        final AMQMethodBody responseBody = connection.getRegistry().createBasicConsumeOkBody(
-            AMQShortString.createAMQShortString("ctag"));
-        connection.writeFrame(responseBody.generateFrame(channelId));
+        process(() -> {
+            final AMQMethodBody responseBody = connection.getRegistry().createBasicConsumeOkBody(
+                AMQShortString.createAMQShortString("ctag"));
+            connection.writeFrame(responseBody.generateFrame(channelId));
+        });
     }
 
     @Override
@@ -245,5 +309,9 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Override
     public void receiveConfirmSelect(boolean nowait) {
 
+    }
+
+    public void closeChannel(int cause, final String message) {
+        connection.closeChannelAndWriteFrame(this, cause, message);
     }
 }

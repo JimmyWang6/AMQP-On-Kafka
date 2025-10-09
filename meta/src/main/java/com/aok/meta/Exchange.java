@@ -54,15 +54,15 @@ public class Exchange extends Meta {
     @Override
     public String toString() {
         return "Exchange{" +
-                "type=" + type +
-                ", durable=" + durable +
-                ", autoDelete=" + autoDelete +
-                ", internal=" + internal +
-                ", arguments=" + arguments +
-                ", vhost='" + getVhost() + '\'' +
-                ", name='" + getName() + '\'' +
-                ", offset=" + getOffset() +
-                '}';
+            "type=" + type +
+            ", durable=" + durable +
+            ", autoDelete=" + autoDelete +
+            ", internal=" + internal +
+            ", arguments=" + arguments +
+            ", vhost='" + getVhost() + '\'' +
+            ", name='" + getName() + '\'' +
+            ", offset=" + getOffset() +
+            '}';
     }
 
     public String getMetaType() {

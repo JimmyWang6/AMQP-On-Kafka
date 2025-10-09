@@ -32,15 +32,15 @@ public class ExchangeService {
 
     public Exchange addExchange(String vhost, String name, ExchangeType exchangeType, Boolean autoDelete, Boolean durable, Boolean internal, Map<String, Object> arguments) {
         Exchange exchange = new Exchange(vhost, name, exchangeType, autoDelete, durable, internal, arguments);
-        return (Exchange) metaContainer.add(exchange);
+        return metaContainer.add(exchange);
     }
 
     public Exchange getExchange(String vhost, String name) {
-        return (Exchange) metaContainer.get(Exchange.class, vhost, name);
+        return metaContainer.get(Exchange.class, vhost, name);
     }
 
     public Exchange deleteExchange(Exchange exchange) {
-        return (Exchange) metaContainer.delete(exchange);
+        return metaContainer.delete(exchange);
     }
 
     public int size() {

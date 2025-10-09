@@ -32,9 +32,11 @@ import org.apache.qpid.server.protocol.v0_8.AMQFrameDecodingException;
 import org.apache.qpid.server.protocol.v0_8.AMQShortString;
 import org.apache.qpid.server.protocol.v0_8.FieldTable;
 import org.apache.qpid.server.protocol.v0_8.transport.AMQDataBlock;
+import org.apache.qpid.server.protocol.v0_8.transport.AMQFrame;
 import org.apache.qpid.server.protocol.v0_8.transport.AMQMethodBody;
 import org.apache.qpid.server.protocol.v0_8.transport.AMQProtocolHeaderException;
 import org.apache.qpid.server.protocol.v0_8.transport.ChannelOpenOkBody;
+import org.apache.qpid.server.protocol.v0_8.transport.ConnectionCloseBody;
 import org.apache.qpid.server.protocol.v0_8.transport.ConnectionTuneBody;
 import org.apache.qpid.server.protocol.v0_8.transport.MethodRegistry;
 import org.apache.qpid.server.protocol.v0_8.transport.ProtocolInitiation;
@@ -215,6 +217,28 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     public AmqpChannel getChannel(int channelId) {
         return channels.get(channelId);
+    }
+
+    public void sendConnectionClose(int errorCode, String message, int channelId) {
+        sendConnectionClose(channelId, new AMQFrame(0, new ConnectionCloseBody(getProtocolVersion(),
+            errorCode, AMQShortString.validValueOf(message), currentClassId, currentMethodId)));
+    }
+
+    private void sendConnectionClose(int channelId, AMQFrame frame) {
+        writeFrame(frame);
+    }
+
+    public void closeChannelAndWriteFrame(AmqpChannel channel, int cause, String message) {
+        closeChannel(channel);
+        writeFrame(new AMQFrame(channel.getChannelId(),
+            registry.createChannelCloseBody(cause,
+                AMQShortString.validValueOf(message),
+                currentClassId,
+                currentMethodId)));
+    }
+
+    protected void closeChannel(AmqpChannel channel) {
+
     }
 
 }

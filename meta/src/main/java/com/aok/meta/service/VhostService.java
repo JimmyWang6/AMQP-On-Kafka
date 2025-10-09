@@ -31,11 +31,11 @@ public class VhostService {
 
     public Vhost addVhost(String name) {
         Vhost vhost = new Vhost(name);
-        return (Vhost) metaContainer.add(vhost);
+        return metaContainer.add(vhost);
     }
 
     public Vhost deleteVhost(Vhost vhost) {
-        return (Vhost) metaContainer.delete(vhost);
+        return metaContainer.delete(vhost);
     }
 
     public List<Vhost> listVhost() {
@@ -46,3 +46,4 @@ public class VhostService {
         return metaContainer.size(Vhost.class);
     }
 }
+
