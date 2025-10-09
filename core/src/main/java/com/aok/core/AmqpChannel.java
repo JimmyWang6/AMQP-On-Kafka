@@ -47,6 +47,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Getter
     private final int channelId;
 
+    private final VhostService vhostService;
+
     private final BindingService bindingService;
 
     private final ExchangeService exchangeService;
