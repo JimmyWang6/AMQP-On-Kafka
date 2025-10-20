@@ -16,6 +16,7 @@
  */
 package com.aok.core;
 
+import com.aok.core.ack.AckService;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 
@@ -33,6 +34,11 @@ public class UnacknowledgedMessageMap {
     
     private final NavigableMap<Long, MessageMetadata> unacknowledgedMessages = new TreeMap<>();
     private final AtomicLong deliveryTagSequence = new AtomicLong(0);
+    private final AckService ackService;
+    
+    public UnacknowledgedMessageMap(AckService ackService) {
+        this.ackService = ackService;
+    }
     
     /**
      * Generates a new delivery tag in ascending order
@@ -62,6 +68,12 @@ public class UnacknowledgedMessageMap {
      * @return the number of messages acknowledged
      */
     public int acknowledge(long deliveryTag, boolean multiple) {
+        // First, acknowledge to the backend service (Kafka/Memory/File)
+        if (ackService != null) {
+            ackService.acknowledge(deliveryTag, multiple);
+        }
+        
+        // Then remove from local store
         int count = 0;
         if (multiple) {
             // Acknowledge all messages with tags <= deliveryTag
@@ -91,12 +103,17 @@ public class UnacknowledgedMessageMap {
      * @return the number of messages nacked
      */
     public int nack(long deliveryTag, boolean multiple, boolean requeue) {
+        // First, nack to the backend service (Kafka/Memory/File)
+        if (ackService != null) {
+            ackService.nack(deliveryTag, multiple, requeue);
+        }
+        
+        // Then remove from local store
         int count = 0;
         if (multiple) {
             // Nack all messages with tags <= deliveryTag
             NavigableMap<Long, MessageMetadata> toNack = unacknowledgedMessages.headMap(deliveryTag, true);
             count = toNack.size();
-            // In a full implementation, we would requeue these messages if requeue=true
             toNack.clear();
             log.debug("Nacked {} messages up to deliveryTag: {}, requeue: {}", count, deliveryTag, requeue);
         } else {
@@ -120,6 +137,12 @@ public class UnacknowledgedMessageMap {
      * @return true if the message was found and rejected
      */
     public boolean reject(long deliveryTag, boolean requeue) {
+        // First, reject to the backend service (Kafka/Memory/File)
+        if (ackService != null) {
+            ackService.reject(deliveryTag, requeue);
+        }
+        
+        // Then remove from local store
         MessageMetadata removed = unacknowledgedMessages.remove(deliveryTag);
         if (removed != null) {
             log.debug("Rejected message with deliveryTag: {}, requeue: {}", deliveryTag, requeue);

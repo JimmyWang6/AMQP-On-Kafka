@@ -82,6 +82,8 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     private volatile long frameMax;
     
     private volatile int heartbeat;
+    
+    private volatile boolean closed = false;
 
     AmqpConnection(VhostService vhostService, ExchangeService exchangeService, QueueService queueService, BindingService bindingService, ProduceService produceService) {
         this.vhostService = vhostService;
@@ -145,13 +147,13 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
         log.info("Received connection close: code={}, text={}", replyCode, replyText);
         AMQMethodBody responseBody = registry.createConnectionCloseOkBody();
         writeFrame(responseBody.generateFrame(0));
-        ctx.close();
+        close();
     }
 
     @Override
     public void receiveConnectionCloseOk() {
         log.info("Received connection close-ok, closing connection");
-        ctx.close();
+        close();
     }
 
     @Override
@@ -207,7 +209,35 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        log.info("Channel inactive, cleaning up connection resources");
+        close();
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        log.error("Exception caught in connection", cause);
+        // Send error on connection channel 0 since we don't have channel context here
+        sendConnectionClose(AmqpException.Codes.INTERNAL_ERROR, cause.getMessage(), 0);
+        close();
+    }
+    
+    /**
+     * Closes the connection and cleans up all resources.
+     * Ensures ctx.close() is only called once.
+     */
+    private void close() {
+        if (closed) {
+            return;
+        }
+        
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+        }
+        
+        log.info("Closing connection and cleaning up resources");
+        
         // Close all channels
         channels.values().forEach(channel -> {
             try {
@@ -217,14 +247,11 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
             }
         });
         channels.clear();
-    }
-
-    @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("Exception caught in connection", cause);
-        // Send error on connection channel 0 since we don't have channel context here
-        sendConnectionClose(AmqpException.Codes.INTERNAL_ERROR, cause.getMessage(), 0);
-        ctx.close();
+        
+        // Close the network connection
+        if (ctx != null) {
+            ctx.close();
+        }
     }
 
     @Override
@@ -244,6 +271,10 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     public AmqpChannel getChannel(int channelId) {
         return channels.get(channelId);
+    }
+    
+    public ProduceService getStorage() {
+        return storage;
     }
 
     public void sendConnectionClose(int errorCode, String message, int channelId) {

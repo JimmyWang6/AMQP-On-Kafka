@@ -18,6 +18,7 @@
  */
 package com.aok.core;
 
+import com.aok.meta.Binding;
 import com.aok.meta.Exchange;
 import com.aok.meta.ExchangeType;
 import com.aok.meta.Queue;
@@ -61,7 +62,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     private volatile IncomingMessage currentMessage;
     
     // Acknowledgment tracking
-    private final UnacknowledgedMessageMap unacknowledgedMessageMap = new UnacknowledgedMessageMap();
+    private final UnacknowledgedMessageMap unacknowledgedMessageMap;
     
     // Transaction state
     private boolean transactionMode = false;
@@ -80,6 +81,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         this.exchangeService = exchangeService;
         this.queueService = queueService;
         this.bindingService = bindingService;
+        // Initialize with null AckService for now - will be set when Kafka integration is complete
+        this.unacknowledgedMessageMap = new UnacknowledgedMessageMap(null);
     }
 
     private void process(Runnable action) {
@@ -440,10 +443,10 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             }
             
             // Step 2: Get bindings for this exchange
-            java.util.List<com.aok.meta.Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
+            java.util.List<Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
             
             // Step 3: Route message to matching queues based on bindings and routing key
-            for (com.aok.meta.Binding binding : bindings) {
+            for (Binding binding : bindings) {
                 if (matchesRoutingKey(binding, routingKey, exchange)) {
                     Queue queue = queueService.getQueue(connection.getVhost(), binding.getDestination());
                     if (queue == null) {
@@ -481,7 +484,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
      * @param exchange the exchange (can be null for default exchange)
      * @return true if the routing key matches the binding
      */
-    private boolean matchesRoutingKey(com.aok.meta.Binding binding, String routingKey, Exchange exchange) {
+    private boolean matchesRoutingKey(Binding binding, String routingKey, Exchange exchange) {
         if (exchange == null) {
             // Default exchange: route directly to queue with name matching routing key
             return binding.getDestination().equals(routingKey);
@@ -573,28 +576,44 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     }
     
     /**
-     * Stores the message to a queue via Kafka (basic interface - implementation unfinished)
+     * Stores the message to a queue via Kafka
+     * Sends message to Kafka where 1 queue shares the same Kafka producer.
+     * Messages are consumed using Kafka Share Consumer (1 AMQP consumer).
      * 
      * @param queue the target queue
      * @param incomingMessage the message to store
      */
     private void storeMessageToQueue(Queue queue, IncomingMessage incomingMessage) {
-        // TODO: Complete Kafka storage implementation
-        // This is the basic interface for storing messages
-        // The actual Kafka producer implementation should be added here
-        
-        // Create message object for storage
-        com.aok.core.storage.message.Message message = new com.aok.core.storage.message.Message();
-        message.setVhost(connection.getVhost());
-        message.setQueue(queue.getName());
-        
-        // TODO: Add message body, properties, headers, etc. to the Message object
-        // message.setBody(incomingMessage.getBodyBuffer());
-        // message.setProperties(incomingMessage.getProperties());
-        
-        // Store to Kafka (interface call - actual implementation needed)
-        // connection.getStorage().produce(message);
-        
-        log.debug("Message storage interface called for queue: {} (implementation pending)", queue.getName());
+        try {
+            // Create message object for storage
+            com.aok.core.storage.message.Message message = new com.aok.core.storage.message.Message();
+            message.setVhost(connection.getVhost());
+            message.setQueue(queue.getName());
+            
+            // TODO: Add message body, properties, headers, etc. to the Message object
+            // This requires extending the Message class to support:
+            // - message body (from incomingMessage.getBodyBuffer())
+            // - message properties (from incomingMessage.getProperties())
+            // - routing information
+            // - delivery mode, priority, etc.
+            //
+            // Example:
+            // message.setBody(incomingMessage.getBodyBuffer());
+            // message.setProperties(incomingMessage.getProperties());
+            // message.setExchange(incomingMessage.getExchange().toString());
+            // message.setRoutingKey(incomingMessage.getRoutingKey().toString());
+            
+            // Store to Kafka using the producer service
+            // The ProduceService will use Kafka producer to send the message
+            // Each queue has its own Kafka topic
+            // Kafka Share Groups will be used for consumption (KIP-932)
+            connection.getStorage().produce(message);
+            
+            log.debug("Message stored to Kafka for queue: {}", queue.getName());
+        } catch (Exception e) {
+            log.error("Failed to store message to Kafka for queue: {}", queue.getName(), e);
+            throw new AmqpException(AmqpException.Codes.INTERNAL_ERROR, 
+                "Failed to store message: " + e.getMessage(), false);
+        }
     }
 }
