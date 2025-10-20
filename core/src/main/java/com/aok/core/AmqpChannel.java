@@ -290,12 +290,14 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             if (currentMessageBody == null) {
                 currentMessageBody = data;
             } else {
-                // Append to existing buffer
-                currentMessageBody = QpidByteBuffer.concatenate(currentMessageBody, data);
+                // Append to existing buffer, disposing the original
+                QpidByteBuffer original = currentMessageBody;
+                currentMessageBody = QpidByteBuffer.concatenate(original, data);
+                original.dispose();
             }
             
-            // Check if we've received the complete message
-            if (currentMessageBody != null && currentMessageBody.remaining() >= currentBodySize) {
+            // Check if we've received the complete message (exact match)
+            if (currentMessageBody != null && currentMessageBody.remaining() == currentBodySize) {
                 publishMessage();
             }
         });
@@ -379,11 +381,11 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Override
     public void receiveConfirmSelect(boolean nowait) {
         process(() -> {
-            log.debug("Received confirm.select, enabling publisher confirms");
-            // Publisher confirms is an extension to AMQP 0-9-1
-            // In a full implementation, this would enable publisher confirms
-            // For now, we acknowledge receipt without implementing the feature
-            // Note: createConfirmSelectOkBody may not be available in AMQP 0-8/0-9 protocol
+            log.warn("Received confirm.select - publisher confirms not fully supported in AMQP 0-9-1");
+            // Publisher confirms is an extension to AMQP 0-9-1 and may not be fully supported
+            // Throw an exception to indicate this feature is not implemented
+            throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, 
+                "Publisher confirms are not implemented", false);
         });
     }
 

@@ -222,6 +222,7 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         log.error("Exception caught in connection", cause);
+        // Send error on connection channel 0 since we don't have channel context here
         sendConnectionClose(AmqpException.Codes.INTERNAL_ERROR, cause.getMessage(), 0);
         ctx.close();
     }
