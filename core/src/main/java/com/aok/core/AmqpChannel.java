@@ -55,6 +55,16 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     private  final QueueService queueService;
     
+    // Message publishing state
+    private AMQShortString currentExchange;
+    private AMQShortString currentRoutingKey;
+    private BasicContentHeaderProperties currentMessageProperties;
+    private long currentBodySize;
+    private QpidByteBuffer currentMessageBody;
+    
+    // Transaction state
+    private boolean transactionMode = false;
+    
     AmqpChannel(
         AmqpConnection connection,
         int channelId,
@@ -80,8 +90,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             if (ex.shouldCloseConnection()) {
                 connection.sendConnectionClose(errorCode, message, channelId);
             } else {
-                //TODO by default close channel
-
+                // Close channel on error
+                closeChannel(errorCode, message);
             }
         } catch (Exception e) {
             log.error("channel {} process exception {}", channelId, e);
@@ -233,7 +243,13 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveBasicPublish(AMQShortString exchange, AMQShortString routingKey, boolean mandatory, boolean immediate) {
-
+        process(() -> {
+            log.debug("Received basic.publish: exchange={}, routingKey={}, mandatory={}, immediate={}", 
+                exchange, routingKey, mandatory, immediate);
+            this.currentExchange = exchange;
+            this.currentRoutingKey = routingKey;
+            // Message header and content will be received in subsequent calls
+        });
     }
 
     @Override
@@ -248,27 +264,55 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveChannelFlowOk(boolean active) {
-
+        log.debug("Received channel.flow-ok: active={}", active);
     }
 
     @Override
     public void receiveChannelClose(int replyCode, AMQShortString replyText, int classId, int methodId) {
-
+        log.info("Received channel.close: code={}, text={}, classId={}, methodId={}", 
+            replyCode, replyText, classId, methodId);
+        // Send close-ok response
+        connection.writeFrame(connection.getRegistry().createChannelCloseOkBody().generateFrame(channelId));
+        // Close the channel
+        connection.closeChannel(this);
     }
 
     @Override
     public void receiveChannelCloseOk() {
-
+        log.info("Received channel.close-ok for channel {}", channelId);
+        connection.closeChannel(this);
     }
 
     @Override
     public void receiveMessageContent(QpidByteBuffer data) {
-
+        process(() -> {
+            // Accumulate message body
+            if (currentMessageBody == null) {
+                currentMessageBody = data;
+            } else {
+                // Append to existing buffer
+                currentMessageBody = QpidByteBuffer.concatenate(currentMessageBody, data);
+            }
+            
+            // Check if we've received the complete message
+            if (currentMessageBody != null && currentMessageBody.remaining() >= currentBodySize) {
+                publishMessage();
+            }
+        });
     }
 
     @Override
     public void receiveMessageHeader(BasicContentHeaderProperties properties, long bodySize) {
-
+        process(() -> {
+            log.debug("Received message header: bodySize={}", bodySize);
+            this.currentMessageProperties = properties;
+            this.currentBodySize = bodySize;
+            
+            // If body size is 0, publish immediately
+            if (bodySize == 0) {
+                publishMessage();
+            }
+        });
     }
 
     @Override
@@ -278,40 +322,105 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveBasicNack(long deliveryTag, boolean multiple, boolean requeue) {
-
+        log.debug("Received basic.nack: deliveryTag={}, multiple={}, requeue={}", deliveryTag, multiple, requeue);
+        // In a full implementation, this would handle negative acknowledgment of messages
+        // For now, we just log it
     }
 
     @Override
     public void receiveBasicAck(long deliveryTag, boolean multiple) {
-
+        log.debug("Received basic.ack: deliveryTag={}, multiple={}", deliveryTag, multiple);
+        // In a full implementation, this would handle acknowledgment of messages
+        // For now, we just log it
     }
 
     @Override
     public void receiveBasicReject(long deliveryTag, boolean requeue) {
-
+        log.debug("Received basic.reject: deliveryTag={}, requeue={}", deliveryTag, requeue);
+        // In a full implementation, this would handle rejection of messages
+        // For now, we just log it
     }
 
     @Override
     public void receiveTxSelect() {
-
+        process(() -> {
+            log.debug("Received tx.select, enabling transaction mode");
+            transactionMode = true;
+            connection.writeFrame(connection.getRegistry().createTxSelectOkBody().generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveTxCommit() {
-
+        process(() -> {
+            log.debug("Received tx.commit");
+            if (!transactionMode) {
+                throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, 
+                    "Channel not in transaction mode", false);
+            }
+            // In a full implementation, this would commit pending messages
+            connection.writeFrame(connection.getRegistry().createTxCommitOkBody().generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveTxRollback() {
-
+        process(() -> {
+            log.debug("Received tx.rollback");
+            if (!transactionMode) {
+                throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, 
+                    "Channel not in transaction mode", false);
+            }
+            // In a full implementation, this would rollback pending messages
+            connection.writeFrame(connection.getRegistry().createTxRollbackOkBody().generateFrame(channelId));
+        });
     }
 
     @Override
     public void receiveConfirmSelect(boolean nowait) {
-
+        process(() -> {
+            log.debug("Received confirm.select, enabling publisher confirms");
+            // Publisher confirms is an extension to AMQP 0-9-1
+            // In a full implementation, this would enable publisher confirms
+            // For now, we acknowledge receipt without implementing the feature
+            // Note: createConfirmSelectOkBody may not be available in AMQP 0-8/0-9 protocol
+        });
     }
 
     public void closeChannel(int cause, final String message) {
         connection.closeChannelAndWriteFrame(this, cause, message);
+    }
+    
+    /**
+     * Publishes the accumulated message to the storage layer
+     */
+    private void publishMessage() {
+        try {
+            String exchangeName = currentExchange == null ? "" : currentExchange.toString();
+            String routingKey = currentRoutingKey == null ? "" : currentRoutingKey.toString();
+            
+            log.debug("Publishing message: exchange={}, routingKey={}, bodySize={}", 
+                exchangeName, routingKey, currentBodySize);
+            
+            // In a full implementation, this would:
+            // 1. Route the message through the exchange
+            // 2. Determine target queues based on bindings and routing key
+            // 3. Store the message to Kafka
+            // For now, we just log the publish event
+            
+            // TODO: Implement message routing and storage
+            // Example: connection.getStorage().produce(message);
+            
+        } finally {
+            // Clear message state
+            currentExchange = null;
+            currentRoutingKey = null;
+            currentMessageProperties = null;
+            currentBodySize = 0;
+            if (currentMessageBody != null) {
+                currentMessageBody.dispose();
+                currentMessageBody = null;
+            }
+        }
     }
 }
