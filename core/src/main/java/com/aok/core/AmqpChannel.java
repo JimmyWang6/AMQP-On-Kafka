@@ -34,6 +34,8 @@ import org.apache.qpid.server.protocol.v0_8.FieldTable;
 import org.apache.qpid.server.protocol.v0_8.transport.AMQMethodBody;
 import org.apache.qpid.server.protocol.v0_8.transport.AccessRequestOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.BasicContentHeaderProperties;
+import org.apache.qpid.server.protocol.v0_8.transport.ContentBody;
+import org.apache.qpid.server.protocol.v0_8.transport.ContentHeaderBody;
 import org.apache.qpid.server.protocol.v0_8.transport.ExchangeBoundOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.QueueDeclareOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.QueueUnbindOkBody;
@@ -56,11 +58,10 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     private  final QueueService queueService;
     
     // Message publishing state
-    private AMQShortString currentExchange;
-    private AMQShortString currentRoutingKey;
-    private BasicContentHeaderProperties currentMessageProperties;
-    private long currentBodySize;
-    private QpidByteBuffer currentMessageBody;
+    private volatile IncomingMessage currentMessage;
+    
+    // Acknowledgment tracking
+    private final UnacknowledgedMessageMap unacknowledgedMessageMap = new UnacknowledgedMessageMap();
     
     // Transaction state
     private boolean transactionMode = false;
@@ -246,8 +247,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         process(() -> {
             log.debug("Received basic.publish: exchange={}, routingKey={}, mandatory={}, immediate={}", 
                 exchange, routingKey, mandatory, immediate);
-            this.currentExchange = exchange;
-            this.currentRoutingKey = routingKey;
+            // Initialize new incoming message
+            currentMessage = new IncomingMessage(exchange, routingKey, mandatory, immediate);
             // Message header and content will be received in subsequent calls
         });
     }
@@ -271,6 +272,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     public void receiveChannelClose(int replyCode, AMQShortString replyText, int classId, int methodId) {
         log.info("Received channel.close: code={}, text={}, classId={}, methodId={}", 
             replyCode, replyText, classId, methodId);
+        // Clear unacknowledged messages
+        unacknowledgedMessageMap.clear();
         // Send close-ok response
         connection.writeFrame(connection.getRegistry().createChannelCloseOkBody().generateFrame(channelId));
         // Close the channel
@@ -280,24 +283,25 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Override
     public void receiveChannelCloseOk() {
         log.info("Received channel.close-ok for channel {}", channelId);
+        // Clear unacknowledged messages
+        unacknowledgedMessageMap.clear();
         connection.closeChannel(this);
     }
 
     @Override
     public void receiveMessageContent(QpidByteBuffer data) {
         process(() -> {
-            // Accumulate message body
-            if (currentMessageBody == null) {
-                currentMessageBody = data;
-            } else {
-                // Append to existing buffer, disposing the original
-                QpidByteBuffer original = currentMessageBody;
-                currentMessageBody = QpidByteBuffer.concatenate(original, data);
-                original.dispose();
+            if (currentMessage == null) {
+                log.error("Received message content without basic.publish");
+                throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, 
+                    "Message content received without basic.publish", false);
             }
             
-            // Check if we've received the complete message (exact match)
-            if (currentMessageBody != null && currentMessageBody.remaining() == currentBodySize) {
+            // Add content body frame to the current message
+            long currentSize = currentMessage.addContentBodyFrame(new ContentBody(data));
+            
+            // Check if we've received the complete message
+            if (currentMessage.isComplete()) {
                 publishMessage();
             }
         });
@@ -307,8 +311,14 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     public void receiveMessageHeader(BasicContentHeaderProperties properties, long bodySize) {
         process(() -> {
             log.debug("Received message header: bodySize={}", bodySize);
-            this.currentMessageProperties = properties;
-            this.currentBodySize = bodySize;
+            if (currentMessage == null) {
+                log.error("Received message header without basic.publish");
+                throw new AmqpException(AmqpException.Codes.PRECONDITION_FAILED, 
+                    "Message header received without basic.publish", false);
+            }
+            
+            // Set the content header body
+            currentMessage.setContentHeaderBody(new ContentHeaderBody(properties, bodySize));
             
             // If body size is 0, publish immediately
             if (bodySize == 0) {
@@ -324,23 +334,31 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     @Override
     public void receiveBasicNack(long deliveryTag, boolean multiple, boolean requeue) {
-        log.debug("Received basic.nack: deliveryTag={}, multiple={}, requeue={}", deliveryTag, multiple, requeue);
-        // In a full implementation, this would handle negative acknowledgment of messages
-        // For now, we just log it
+        process(() -> {
+            log.debug("Received basic.nack: deliveryTag={}, multiple={}, requeue={}", deliveryTag, multiple, requeue);
+            int count = unacknowledgedMessageMap.nack(deliveryTag, multiple, requeue);
+            log.info("Nacked {} message(s)", count);
+        });
     }
 
     @Override
     public void receiveBasicAck(long deliveryTag, boolean multiple) {
-        log.debug("Received basic.ack: deliveryTag={}, multiple={}", deliveryTag, multiple);
-        // In a full implementation, this would handle acknowledgment of messages
-        // For now, we just log it
+        process(() -> {
+            log.debug("Received basic.ack: deliveryTag={}, multiple={}", deliveryTag, multiple);
+            int count = unacknowledgedMessageMap.acknowledge(deliveryTag, multiple);
+            log.info("Acknowledged {} message(s)", count);
+        });
     }
 
     @Override
     public void receiveBasicReject(long deliveryTag, boolean requeue) {
-        log.debug("Received basic.reject: deliveryTag={}, requeue={}", deliveryTag, requeue);
-        // In a full implementation, this would handle rejection of messages
-        // For now, we just log it
+        process(() -> {
+            log.debug("Received basic.reject: deliveryTag={}, requeue={}", deliveryTag, requeue);
+            boolean rejected = unacknowledgedMessageMap.reject(deliveryTag, requeue);
+            if (rejected) {
+                log.info("Rejected message with deliveryTag: {}", deliveryTag);
+            }
+        });
     }
 
     @Override
@@ -394,34 +412,56 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     }
     
     /**
-     * Publishes the accumulated message to the storage layer
+     * Publishes the accumulated message to the storage layer (draft version)
      */
     private void publishMessage() {
+        if (currentMessage == null) {
+            log.warn("publishMessage called but no current message");
+            return;
+        }
+        
         try {
-            String exchangeName = currentExchange == null ? "" : currentExchange.toString();
-            String routingKey = currentRoutingKey == null ? "" : currentRoutingKey.toString();
+            String exchangeName = currentMessage.getExchange() == null ? "" : currentMessage.getExchange().toString();
+            String routingKey = currentMessage.getRoutingKey() == null ? "" : currentMessage.getRoutingKey().toString();
+            long bodySize = currentMessage.getExpectedBodySize();
             
-            log.debug("Publishing message: exchange={}, routingKey={}, bodySize={}", 
-                exchangeName, routingKey, currentBodySize);
+            log.info("Publishing message: exchange={}, routingKey={}, bodySize={}", 
+                exchangeName, routingKey, bodySize);
             
-            // In a full implementation, this would:
-            // 1. Route the message through the exchange
+            // Draft implementation - Message routing and storage
+            // TODO: Complete the following steps:
+            // 1. Route the message through the exchange based on exchange type
             // 2. Determine target queues based on bindings and routing key
-            // 3. Store the message to Kafka
-            // For now, we just log the publish event
+            // 3. Store the message to Kafka for each target queue
+            // 4. Generate delivery tags for each queue if messages are being delivered
             
-            // TODO: Implement message routing and storage
-            // Example: connection.getStorage().produce(message);
+            // Example flow (to be implemented):
+            // Exchange exchange = exchangeService.getExchange(connection.getVhost(), exchangeName);
+            // List<Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
+            // for (Binding binding : bindings) {
+            //     if (matchesRoutingKey(binding, routingKey)) {
+            //         Queue queue = queueService.getQueue(connection.getVhost(), binding.getDestination());
+            //         // Store message to queue/Kafka
+            //         // connection.getStorage().produce(createMessage(queue, currentMessage));
+            //         
+            //         // If delivering immediately, generate delivery tag
+            //         long deliveryTag = unacknowledgedMessageMap.generateDeliveryTag();
+            //         unacknowledgedMessageMap.addMessage(deliveryTag, 
+            //             new UnacknowledgedMessageMap.MessageMetadata(queue.getName()));
+            //     }
+            // }
             
+            log.debug("Message published successfully");
+            
+        } catch (Exception e) {
+            log.error("Error publishing message", e);
+            throw new AmqpException(AmqpException.Codes.INTERNAL_ERROR, 
+                "Failed to publish message: " + e.getMessage(), false);
         } finally {
             // Clear message state
-            currentExchange = null;
-            currentRoutingKey = null;
-            currentMessageProperties = null;
-            currentBodySize = 0;
-            if (currentMessageBody != null) {
-                currentMessageBody.dispose();
-                currentMessageBody = null;
+            if (currentMessage != null) {
+                currentMessage.dispose();
+                currentMessage = null;
             }
         }
     }
