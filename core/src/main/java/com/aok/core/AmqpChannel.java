@@ -428,28 +428,35 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             log.info("Publishing message: exchange={}, routingKey={}, bodySize={}", 
                 exchangeName, routingKey, bodySize);
             
-            // Draft implementation - Message routing and storage
-            // TODO: Complete the following steps:
-            // 1. Route the message through the exchange based on exchange type
-            // 2. Determine target queues based on bindings and routing key
-            // 3. Store the message to Kafka for each target queue
-            // 4. Generate delivery tags for each queue if messages are being delivered
+            // Step 1: Get the exchange (handle default exchange case)
+            Exchange exchange = null;
+            if (!exchangeName.isEmpty()) {
+                exchange = exchangeService.getExchange(connection.getVhost(), exchangeName);
+                if (exchange == null) {
+                    log.error("Exchange not found: {}", exchangeName);
+                    throw new AmqpException(AmqpException.Codes.NOT_FOUND, 
+                        "Exchange not found: " + exchangeName, false);
+                }
+            }
             
-            // Example flow (to be implemented):
-            // Exchange exchange = exchangeService.getExchange(connection.getVhost(), exchangeName);
-            // List<Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
-            // for (Binding binding : bindings) {
-            //     if (matchesRoutingKey(binding, routingKey)) {
-            //         Queue queue = queueService.getQueue(connection.getVhost(), binding.getDestination());
-            //         // Store message to queue/Kafka
-            //         // connection.getStorage().produce(createMessage(queue, currentMessage));
-            //         
-            //         // If delivering immediately, generate delivery tag
-            //         long deliveryTag = unacknowledgedMessageMap.generateDeliveryTag();
-            //         unacknowledgedMessageMap.addMessage(deliveryTag, 
-            //             new UnacknowledgedMessageMap.MessageMetadata(queue.getName()));
-            //     }
-            // }
+            // Step 2: Get bindings for this exchange
+            java.util.List<com.aok.meta.Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
+            
+            // Step 3: Route message to matching queues based on bindings and routing key
+            for (com.aok.meta.Binding binding : bindings) {
+                if (matchesRoutingKey(binding, routingKey, exchange)) {
+                    Queue queue = queueService.getQueue(connection.getVhost(), binding.getDestination());
+                    if (queue == null) {
+                        log.warn("Queue not found: {}", binding.getDestination());
+                        continue;
+                    }
+                    
+                    // Step 4: Store message to Kafka (interface call - implementation left unfinished)
+                    storeMessageToQueue(queue, currentMessage);
+                    
+                    log.debug("Message routed to queue: {}", queue.getName());
+                }
+            }
             
             log.debug("Message published successfully");
             
@@ -464,5 +471,130 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 currentMessage = null;
             }
         }
+    }
+    
+    /**
+     * Matches the routing key against the binding based on exchange type
+     * 
+     * @param binding the binding to check
+     * @param routingKey the routing key from the message
+     * @param exchange the exchange (can be null for default exchange)
+     * @return true if the routing key matches the binding
+     */
+    private boolean matchesRoutingKey(com.aok.meta.Binding binding, String routingKey, Exchange exchange) {
+        if (exchange == null) {
+            // Default exchange: route directly to queue with name matching routing key
+            return binding.getDestination().equals(routingKey);
+        }
+        
+        ExchangeType exchangeType = exchange.getType();
+        String bindingKey = binding.getRoutingKey();
+        
+        switch (exchangeType) {
+            case Direct:
+                // Direct exchange: exact match
+                return routingKey.equals(bindingKey);
+                
+            case Fanout:
+                // Fanout exchange: always match (ignore routing key)
+                return true;
+                
+            case Topic:
+                // Topic exchange: pattern matching with wildcards
+                return matchesTopicPattern(routingKey, bindingKey);
+                
+            case Headers:
+                // Headers exchange: not implemented in this draft
+                log.warn("Headers exchange not implemented");
+                return false;
+                
+            default:
+                return false;
+        }
+    }
+    
+    /**
+     * Matches a routing key against a topic pattern with wildcards
+     * * (star) can substitute for exactly one word
+     * # (hash) can substitute for zero or more words
+     * 
+     * @param routingKey the routing key to match
+     * @param pattern the binding pattern
+     * @return true if the routing key matches the pattern
+     */
+    private boolean matchesTopicPattern(String routingKey, String pattern) {
+        String[] routingParts = routingKey.split("\\.");
+        String[] patternParts = pattern.split("\\.");
+        
+        return matchesTopicPatternRecursive(routingParts, 0, patternParts, 0);
+    }
+    
+    private boolean matchesTopicPatternRecursive(String[] routingParts, int routingIndex, 
+                                                  String[] patternParts, int patternIndex) {
+        // If we've consumed both patterns, it's a match
+        if (routingIndex >= routingParts.length && patternIndex >= patternParts.length) {
+            return true;
+        }
+        
+        // If pattern is exhausted but routing key isn't, no match (unless last pattern was #)
+        if (patternIndex >= patternParts.length) {
+            return false;
+        }
+        
+        String patternPart = patternParts[patternIndex];
+        
+        // Handle # (zero or more words)
+        if ("#".equals(patternPart)) {
+            // # at the end matches everything
+            if (patternIndex == patternParts.length - 1) {
+                return true;
+            }
+            // Try matching zero words (skip #) or one+ words
+            if (matchesTopicPatternRecursive(routingParts, routingIndex, patternParts, patternIndex + 1)) {
+                return true;
+            }
+            if (routingIndex < routingParts.length) {
+                return matchesTopicPatternRecursive(routingParts, routingIndex + 1, patternParts, patternIndex);
+            }
+            return false;
+        }
+        
+        // If routing key is exhausted but pattern isn't, no match
+        if (routingIndex >= routingParts.length) {
+            return false;
+        }
+        
+        // Handle * (exactly one word) or exact match
+        if ("*".equals(patternPart) || patternPart.equals(routingParts[routingIndex])) {
+            return matchesTopicPatternRecursive(routingParts, routingIndex + 1, patternParts, patternIndex + 1);
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Stores the message to a queue via Kafka (basic interface - implementation unfinished)
+     * 
+     * @param queue the target queue
+     * @param incomingMessage the message to store
+     */
+    private void storeMessageToQueue(Queue queue, IncomingMessage incomingMessage) {
+        // TODO: Complete Kafka storage implementation
+        // This is the basic interface for storing messages
+        // The actual Kafka producer implementation should be added here
+        
+        // Create message object for storage
+        com.aok.core.storage.message.Message message = new com.aok.core.storage.message.Message();
+        message.setVhost(connection.getVhost());
+        message.setQueue(queue.getName());
+        
+        // TODO: Add message body, properties, headers, etc. to the Message object
+        // message.setBody(incomingMessage.getBodyBuffer());
+        // message.setProperties(incomingMessage.getProperties());
+        
+        // Store to Kafka (interface call - actual implementation needed)
+        // connection.getStorage().produce(message);
+        
+        log.debug("Message storage interface called for queue: {} (implementation pending)", queue.getName());
     }
 }
