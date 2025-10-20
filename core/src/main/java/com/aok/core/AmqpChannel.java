@@ -587,21 +587,63 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         try {
             // Create message object for storage
             com.aok.core.storage.message.Message message = new com.aok.core.storage.message.Message();
+            
+            // Set routing information
             message.setVhost(connection.getVhost());
             message.setQueue(queue.getName());
+            message.setExchange(incomingMessage.getExchange() != null ? incomingMessage.getExchange().toString() : "");
+            message.setRoutingKey(incomingMessage.getRoutingKey() != null ? incomingMessage.getRoutingKey().toString() : "");
             
-            // TODO: Add message body, properties, headers, etc. to the Message object
-            // This requires extending the Message class to support:
-            // - message body (from incomingMessage.getBodyBuffer())
-            // - message properties (from incomingMessage.getProperties())
-            // - routing information
-            // - delivery mode, priority, etc.
-            //
-            // Example:
-            // message.setBody(incomingMessage.getBodyBuffer());
-            // message.setProperties(incomingMessage.getProperties());
-            // message.setExchange(incomingMessage.getExchange().toString());
-            // message.setRoutingKey(incomingMessage.getRoutingKey().toString());
+            // Set message flags
+            message.setMandatory(incomingMessage.isMandatory());
+            message.setImmediate(incomingMessage.isImmediate());
+            
+            // Set message body
+            org.apache.qpid.server.bytebuffer.QpidByteBuffer bodyBuffer = incomingMessage.getBodyBuffer();
+            if (bodyBuffer != null && bodyBuffer.hasRemaining()) {
+                byte[] bodyBytes = new byte[bodyBuffer.remaining()];
+                bodyBuffer.get(bodyBytes);
+                message.setBody(bodyBytes);
+                message.setBodySize(bodyBytes.length);
+                // Reset buffer position for potential reuse
+                bodyBuffer.position(bodyBuffer.position() - bodyBytes.length);
+            } else {
+                message.setBody(new byte[0]);
+                message.setBodySize(0);
+            }
+            
+            // Set message properties from AMQP BasicContentHeaderProperties
+            org.apache.qpid.server.protocol.v0_8.transport.BasicContentHeaderProperties properties = incomingMessage.getProperties();
+            if (properties != null) {
+                message.setContentType(properties.getContentTypeAsString());
+                message.setContentEncoding(properties.getEncodingAsString());
+                message.setDeliveryMode((int) properties.getDeliveryMode());
+                message.setPriority((int) properties.getPriority());
+                message.setCorrelationId(properties.getCorrelationIdAsString());
+                message.setReplyTo(properties.getReplyToAsString());
+                // Expiration is stored as long (milliseconds) in AMQP 0-8
+                long expiration = properties.getExpiration();
+                message.setExpiration(expiration > 0 ? String.valueOf(expiration) : null);
+                message.setMessageId(properties.getMessageIdAsString());
+                message.setType(properties.getTypeAsString());
+                message.setUserId(properties.getUserIdAsString());
+                message.setAppId(properties.getAppIdAsString());
+                
+                // Set timestamp
+                if (properties.getTimestamp() > 0) {
+                    message.setTimestamp(properties.getTimestamp());
+                } else {
+                    message.setTimestamp(System.currentTimeMillis());
+                }
+                
+                // Set headers - BasicContentHeaderProperties doesn't have headers in AMQP 0-8/0-9
+                // Headers are typically stored in a separate headers exchange
+                // For now, initialize empty map
+                message.setHeaders(new java.util.HashMap<>());
+            } else {
+                // Set default timestamp if no properties
+                message.setTimestamp(System.currentTimeMillis());
+            }
             
             // Store to Kafka using the producer service
             // The ProduceService will use Kafka producer to send the message
@@ -609,7 +651,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             // Kafka Share Groups will be used for consumption (KIP-932)
             connection.getStorage().produce(message);
             
-            log.debug("Message stored to Kafka for queue: {}", queue.getName());
+            log.debug("Message stored to Kafka for queue: {} with body size: {} bytes", 
+                queue.getName(), message.getBodySize());
         } catch (Exception e) {
             log.error("Failed to store message to Kafka for queue: {}", queue.getName(), e);
             throw new AmqpException(AmqpException.Codes.INTERNAL_ERROR, 
