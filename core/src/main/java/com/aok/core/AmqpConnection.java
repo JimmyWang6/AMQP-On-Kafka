@@ -76,6 +76,14 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     private volatile int currentClassId;
 
     private volatile int currentMethodId;
+    
+    private volatile int channelMax;
+    
+    private volatile long frameMax;
+    
+    private volatile int heartbeat;
+    
+    private volatile boolean closed = false;
 
     AmqpConnection(VhostService vhostService, ExchangeService exchangeService, QueueService queueService, BindingService bindingService, ProduceService produceService) {
         this.vhostService = vhostService;
@@ -104,7 +112,10 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     @Override
     public void receiveConnectionTuneOk(int channelMax, long frameMax, int heartbeat) {
-
+        this.channelMax = channelMax;
+        this.frameMax = frameMax;
+        this.heartbeat = heartbeat;
+        log.debug("Connection tuned: channelMax={}, frameMax={}, heartbeat={}", channelMax, frameMax, heartbeat);
     }
 
     @Override
@@ -133,17 +144,23 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     @Override
     public void receiveConnectionClose(int replyCode, AMQShortString replyText, int classId, int methodId) {
-
+        log.info("Received connection close: code={}, text={}", replyCode, replyText);
+        AMQMethodBody responseBody = registry.createConnectionCloseOkBody();
+        writeFrame(responseBody.generateFrame(0));
+        close();
     }
 
     @Override
     public void receiveConnectionCloseOk() {
-        
+        log.info("Received connection close-ok, closing connection");
+        close();
     }
 
     @Override
     public void receiveHeartbeat() {
-
+        log.debug("Received heartbeat, sending heartbeat response");
+        // Echo back a heartbeat frame
+        writeFrame(new AMQFrame(0, new org.apache.qpid.server.protocol.v0_8.transport.HeartbeatBody()));
     }
 
     @Override
@@ -192,12 +209,49 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        
+        close();
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        log.error("Exception caught in connection", cause);
+        // Send error on connection channel 0 since we don't have channel context here
+        sendConnectionClose(AmqpException.Codes.INTERNAL_ERROR, cause.getMessage(), 0);
+        close();
+    }
+    
+    /**
+     * Closes the connection and cleans up all resources.
+     * Ensures ctx.close() is only called once.
+     */
+    private void close() {
+        if (closed) {
+            return;
+        }
         
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+        }
+        
+        log.info("Closing connection and cleaning up resources");
+        
+        // Close all channels
+        channels.values().forEach(channel -> {
+            try {
+                closeChannel(channel);
+            } catch (Exception e) {
+                log.error("Error closing channel {}", channel.getChannelId(), e);
+            }
+        });
+        channels.clear();
+        
+        // Close the network connection
+        if (ctx != null) {
+            ctx.close();
+        }
     }
 
     @Override
@@ -217,6 +271,10 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     public AmqpChannel getChannel(int channelId) {
         return channels.get(channelId);
+    }
+    
+    public ProduceService getStorage() {
+        return storage;
     }
 
     public void sendConnectionClose(int errorCode, String message, int channelId) {
@@ -238,7 +296,10 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     }
 
     protected void closeChannel(AmqpChannel channel) {
-
+        if (channel != null) {
+            channels.remove(channel.getChannelId());
+            log.debug("Channel {} closed and removed", channel.getChannelId());
+        }
     }
 
 }
