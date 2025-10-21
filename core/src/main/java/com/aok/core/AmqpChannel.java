@@ -18,6 +18,7 @@
  */
 package com.aok.core;
 
+import com.aok.core.storage.message.Message;
 import com.aok.meta.Binding;
 import com.aok.meta.Exchange;
 import com.aok.meta.ExchangeType;
@@ -41,6 +42,8 @@ import org.apache.qpid.server.protocol.v0_8.transport.ExchangeBoundOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.QueueDeclareOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.QueueUnbindOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.ServerChannelMethodProcessor;
+
+import java.util.List;
 
 @Slf4j
 public class AmqpChannel implements ServerChannelMethodProcessor {
@@ -443,7 +446,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             }
             
             // Step 2: Get bindings for this exchange
-            java.util.List<Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
+            List<Binding> bindings = bindingService.listBindings(connection.getVhost(), exchangeName);
             
             // Step 3: Route message to matching queues based on bindings and routing key
             for (Binding binding : bindings) {
@@ -586,7 +589,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     private void storeMessageToQueue(Queue queue, IncomingMessage incomingMessage) {
         try {
             // Create message object for storage
-            com.aok.core.storage.message.Message message = new com.aok.core.storage.message.Message();
+            Message message = new Message();
             
             // Set routing information
             message.setVhost(connection.getVhost());
@@ -599,7 +602,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             message.setImmediate(incomingMessage.isImmediate());
             
             // Set message body
-            org.apache.qpid.server.bytebuffer.QpidByteBuffer bodyBuffer = incomingMessage.getBodyBuffer();
+            QpidByteBuffer bodyBuffer = incomingMessage.getBodyBuffer();
             if (bodyBuffer != null && bodyBuffer.hasRemaining()) {
                 byte[] bodyBytes = new byte[bodyBuffer.remaining()];
                 bodyBuffer.get(bodyBytes);
@@ -613,7 +616,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             }
             
             // Set message properties from AMQP BasicContentHeaderProperties
-            org.apache.qpid.server.protocol.v0_8.transport.BasicContentHeaderProperties properties = incomingMessage.getProperties();
+            BasicContentHeaderProperties properties = incomingMessage.getProperties();
             if (properties != null) {
                 message.setContentType(properties.getContentTypeAsString());
                 message.setContentEncoding(properties.getEncodingAsString());
