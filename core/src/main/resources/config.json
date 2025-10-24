@@ -1,0 +1,35 @@
+{
+  "name" : "MyBroker",
+  "modelVersion" : "8.0",
+  "authenticationproviders" : [ {
+    "name" : "plain",
+    "type" : "Plain",
+    "secureOnlyMechanisms" : [ ],
+    "users" : [ {
+      "name" : "guest",
+      "password" : "guest",
+      "type" : "managed"
+    } ]
+  } ],
+  "ports" : [ {
+    "name" : "AMQP",
+    "port" : 5672,
+    "authenticationProvider" : "plain",
+    "virtualhostaliases" : [ {
+      "name" : "defaultAlias",
+      "type" : "defaultAlias"
+    }, {
+      "name" : "hostnameAlias",
+      "type" : "hostnameAlias"
+    }, {
+      "name" : "nameAlias",
+      "type" : "nameAlias"
+    } ]
+  }],
+  "virtualhostnodes" : [ {
+    "name" : "default",
+    "type" : "Memory",
+    "defaultVirtualHostNode" : "true",
+    "virtualHostInitialConfiguration" : "{\"type\": \"Memory\"}"
+  } ]
+}
