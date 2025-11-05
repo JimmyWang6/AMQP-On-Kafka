@@ -18,6 +18,7 @@
  */
 package com.aok.core;
 
+import com.aok.core.storage.ConsumeService;
 import com.aok.core.storage.message.Message;
 import com.aok.meta.Binding;
 import com.aok.meta.Exchange;
@@ -76,8 +77,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     private final ConsumerContainer consumerContainer;
     private final AtomicLong consumerTagSequence = new AtomicLong(0);
     
-    // Message delivery tracking for manual ack: deliveryTag -> (topic, partition, offset)
-    private final Map<Long, MessageLocation> deliveryTagToLocation = new ConcurrentHashMap<>();
+    // Message delivery tracking for manual ack: deliveryTag -> (consumerTag, recordRef)
+    private final Map<Long, RecordAckInfo> deliveryTagToRecord = new ConcurrentHashMap<>();
     
     // Transaction state
     private boolean transactionMode = false;
@@ -294,7 +295,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             // Start consuming from Kafka using ConsumeService
             if (connection.getConsumeService() != null) {
                 connection.getConsumeService().startConsuming(consumer, 
-                    (message, topic, partition, offset) -> deliverMessage(consumer, message, topic, partition, offset));
+                    (message, recordRef) -> deliverMessage(consumer, message, recordRef));
             } else {
                 log.warn("ConsumeService not available, consumer {} will not receive messages", actualConsumerTag);
             }
@@ -444,24 +445,22 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             log.debug("Received basic.ack: deliveryTag={}, multiple={}", deliveryTag, multiple);
             
             // Acknowledge to Kafka Share Consumer for manual ack
-            if (connection.getConsumeService() instanceof com.aok.core.storage.KafkaConsumeService) {
-                com.aok.core.storage.KafkaConsumeService kafkaService = 
-                    (com.aok.core.storage.KafkaConsumeService) connection.getConsumeService();
-                
+            ConsumeService consumeService = connection.getConsumeService();
+            if (consumeService != null) {
                 if (multiple) {
                     // Acknowledge all messages up to and including this delivery tag
-                    deliveryTagToLocation.entrySet().stream()
+                    deliveryTagToRecord.entrySet().stream()
                         .filter(entry -> entry.getKey() <= deliveryTag)
                         .forEach(entry -> {
-                            MessageLocation loc = entry.getValue();
-                            kafkaService.acknowledgeMessage(loc.consumerTag, loc.topic, loc.partition, loc.offset);
-                            deliveryTagToLocation.remove(entry.getKey());
+                            RecordAckInfo info = entry.getValue();
+                            consumeService.acknowledgeRecord(info.consumerTag, info.recordRef);
+                            deliveryTagToRecord.remove(entry.getKey());
                         });
                 } else {
                     // Acknowledge single message
-                    MessageLocation loc = deliveryTagToLocation.remove(deliveryTag);
-                    if (loc != null) {
-                        kafkaService.acknowledgeMessage(loc.consumerTag, loc.topic, loc.partition, loc.offset);
+                    RecordAckInfo info = deliveryTagToRecord.remove(deliveryTag);
+                    if (info != null) {
+                        consumeService.acknowledgeRecord(info.consumerTag, info.recordRef);
                     }
                 }
             }
@@ -559,11 +558,9 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
      * 
      * @param consumer the consumer to deliver to
      * @param message the message to deliver
-     * @param topic the Kafka topic
-     * @param partition the Kafka partition
-     * @param offset the Kafka offset
+     * @param recordRef reference to the backend record (for acknowledgment)
      */
-    private void deliverMessage(Consumer consumer, Message message, String topic, int partition, long offset) {
+    private void deliverMessage(Consumer consumer, Message message, Object recordRef) {
         try {
             // Generate delivery tag
             long deliveryTag = unacknowledgedMessageMap.generateDeliveryTag();
@@ -642,18 +639,27 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 connection.writeFrame(new AMQFrame(channelId, contentBody));
             }
             
-            // Track unacknowledged message if noAck is false
-            if (!consumer.isNoAck()) {
+            // Handle acknowledgment based on noAck flag
+            if (consumer.isNoAck()) {
+                // For auto-ack consumers (noAck=true), acknowledge immediately
+                ConsumeService consumeService = connection.getConsumeService();
+                if (consumeService != null) {
+                    consumeService.acknowledgeRecord(consumer.getConsumerTag(), recordRef);
+                    log.debug("Auto-acknowledged message for consumer {}: deliveryTag={}", 
+                        consumer.getConsumerTag(), deliveryTag);
+                }
+            } else {
+                // For manual-ack consumers (noAck=false), track for later acknowledgment
                 unacknowledgedMessageMap.addMessage(deliveryTag, 
                     new UnacknowledgedMessageMap.MessageMetadata(consumer.getQueueName()));
                 
-                // Track Kafka message location for manual ack
-                deliveryTagToLocation.put(deliveryTag, 
-                    new MessageLocation(consumer.getConsumerTag(), topic, partition, offset));
+                // Track record reference for manual ack
+                deliveryTagToRecord.put(deliveryTag, 
+                    new RecordAckInfo(consumer.getConsumerTag(), recordRef));
+                
+                log.debug("Delivered message to consumer {}: deliveryTag={}, bodySize={}, waiting for manual ack", 
+                    consumer.getConsumerTag(), deliveryTag, bodySize);
             }
-            
-            log.debug("Delivered message to consumer {}: deliveryTag={}, bodySize={}, noAck={}", 
-                consumer.getConsumerTag(), deliveryTag, bodySize, consumer.isNoAck());
             
         } catch (Exception e) {
             log.error("Failed to deliver message to consumer {}", consumer.getConsumerTag(), e);
@@ -661,19 +667,15 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     }
     
     /**
-     * Helper class to track Kafka message location for manual acknowledgment
+     * Helper class to track record reference for manual acknowledgment
      */
-    private static class MessageLocation {
+    private static class RecordAckInfo {
         final String consumerTag;
-        final String topic;
-        final int partition;
-        final long offset;
+        final Object recordRef;
         
-        MessageLocation(String consumerTag, String topic, int partition, long offset) {
+        RecordAckInfo(String consumerTag, Object recordRef) {
             this.consumerTag = consumerTag;
-            this.topic = topic;
-            this.partition = partition;
-            this.offset = offset;
+            this.recordRef = recordRef;
         }
     }
     

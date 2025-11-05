@@ -111,32 +111,21 @@ public class KafkaConsumeService implements ConsumeService {
         }
     }
     
-    /**
-     * Acknowledges a message for manual ack consumers.
-     * This is called when receiveBasicAck is invoked by the AMQP client.
-     * 
-     * @param consumerTag the consumer tag
-     * @param topic the Kafka topic
-     * @param partition the Kafka partition
-     * @param offset the Kafka offset
-     */
-    public void acknowledgeMessage(String consumerTag, String topic, int partition, long offset) {
+    @Override
+    public void acknowledgeRecord(String consumerTag, Object recordRef) {
         ShareConsumerInfo info = activeConsumers.get(consumerTag);
-        if (info != null) {
+        if (info != null && recordRef instanceof ConsumerRecord) {
             try {
-                // Acknowledge the specific record in the share group
-                // Note: We create a minimal ConsumerRecord for acknowledgment
-                org.apache.kafka.clients.consumer.ConsumerRecord<String, Message> record = 
-                    new org.apache.kafka.clients.consumer.ConsumerRecord<>(
-                        topic, partition, offset, null, null);
+                @SuppressWarnings("unchecked")
+                ConsumerRecord<String, Message> record = (ConsumerRecord<String, Message>) recordRef;
                 info.kafkaShareConsumer.acknowledge(record);
-                log.debug("Acknowledged message for consumer {}: topic={}, partition={}, offset={}", 
-                    consumerTag, topic, partition, offset);
+                log.debug("Acknowledged record for consumer {}: offset={}", 
+                    consumerTag, record.offset());
             } catch (Exception e) {
-                log.error("Failed to acknowledge message for consumer {}", consumerTag, e);
+                log.error("Failed to acknowledge record for consumer {}", consumerTag, e);
             }
         } else {
-            log.warn("Cannot acknowledge - consumer {} not found", consumerTag);
+            log.warn("Cannot acknowledge - consumer {} not found or invalid record", consumerTag);
         }
     }
     
@@ -188,22 +177,10 @@ public class KafkaConsumeService implements ConsumeService {
                         for (ConsumerRecord<String, Message> record : records) {
                             try {
                                 // Deliver message to AMQP client via callback
-                                info.messageHandler.handleMessage(
-                                    record.value(),
-                                    record.topic(),
-                                    record.partition(),
-                                    record.offset()
-                                );
+                                // Pass the ConsumerRecord for potential acknowledgment
+                                info.messageHandler.handleMessage(record.value(), record);
                                 
                                 info.consumer.incrementMessageCount();
-                                
-                                // For auto-ack consumers (noAck=true), acknowledge immediately
-                                if (info.consumer.isNoAck()) {
-                                    info.kafkaShareConsumer.acknowledge(record);
-                                    log.debug("Auto-acknowledged message for consumer {}: offset={}", 
-                                        consumerTag, record.offset());
-                                }
-                                // For manual ack consumers (noAck=false), acknowledgment happens via receiveBasicAck
                                 
                                 log.trace("Delivered message from offset {} to consumer {}", 
                                     record.offset(), consumerTag);
