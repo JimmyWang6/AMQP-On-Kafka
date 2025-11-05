@@ -71,6 +71,8 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     
     private final ConsumeService consumeService;
     
+    private final ConsumerContainer consumerContainer;
+    
     private final ConcurrentHashMap<Integer, AmqpChannel> channels = new ConcurrentHashMap<>();
 
     @Getter
@@ -88,13 +90,14 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     
     private volatile boolean closed = false;
 
-    AmqpConnection(VhostService vhostService, ExchangeService exchangeService, QueueService queueService, BindingService bindingService, ProduceService produceService, ConsumeService consumeService) {
+    AmqpConnection(VhostService vhostService, ExchangeService exchangeService, QueueService queueService, BindingService bindingService, ProduceService produceService, ConsumeService consumeService, ConsumerContainer consumerContainer) {
         this.vhostService = vhostService;
         this.exchangeService = exchangeService;
         this.queueService = queueService;
         this.bindingService = bindingService;
         this.storage = produceService;
         this.consumeService = consumeService;
+        this.consumerContainer = consumerContainer;
     }
 
     @Getter
@@ -132,7 +135,7 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     @Override
     public void receiveChannelOpen(int channelId) {
         ChannelOpenOkBody response = registry.createChannelOpenOkBody();
-        addChannel(new AmqpChannel(this, channelId, vhostService, exchangeService, queueService, bindingService));
+        addChannel(new AmqpChannel(this, channelId, vhostService, exchangeService, queueService, bindingService, consumerContainer));
         writeFrame(response.generateFrame(channelId));
     }
 

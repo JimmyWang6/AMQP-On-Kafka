@@ -44,6 +44,7 @@ import org.apache.qpid.server.protocol.v0_8.transport.QueueDeclareOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.QueueUnbindOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.ServerChannelMethodProcessor;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -71,9 +72,12 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     // Acknowledgment tracking
     private final UnacknowledgedMessageMap unacknowledgedMessageMap;
     
-    // Consumer tracking
-    private final Map<String, Consumer> consumers = new ConcurrentHashMap<>();
+    // Consumer tracking - use ConsumerContainer for statistics
+    private final ConsumerContainer consumerContainer;
     private final AtomicLong consumerTagSequence = new AtomicLong(0);
+    
+    // Message delivery tracking for manual ack: deliveryTag -> (topic, partition, offset)
+    private final Map<Long, MessageLocation> deliveryTagToLocation = new ConcurrentHashMap<>();
     
     // Transaction state
     private boolean transactionMode = false;
@@ -84,7 +88,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         VhostService vhostService,
         ExchangeService exchangeService,
         QueueService queueService,
-        BindingService bindingService
+        BindingService bindingService,
+        ConsumerContainer consumerContainer
     ) {
         this.connection = connection;
         this.channelId = channelId;
@@ -92,6 +97,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         this.exchangeService = exchangeService;
         this.queueService = queueService;
         this.bindingService = bindingService;
+        this.consumerContainer = consumerContainer;
         // Initialize with null AckService for now - will be set when Kafka integration is complete
         this.unacknowledgedMessageMap = new UnacknowledgedMessageMap(null);
     }
@@ -258,16 +264,16 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
             String actualConsumerTag = consumerTag != null ? consumerTag.toString() 
                 : "ctag-" + channelId + "-" + consumerTagSequence.incrementAndGet();
             
-            // Check if consumer tag already exists
-            if (consumers.containsKey(actualConsumerTag)) {
+            // Check if consumer tag already exists (use container)
+            if (consumerContainer.containsConsumer(actualConsumerTag)) {
                 throw new AmqpException(AmqpException.Codes.NOT_ALLOWED, 
                     "Consumer tag already in use: " + actualConsumerTag, false);
             }
             
-            // Check exclusive access
+            // Check exclusive access (check against other consumers in this channel)
             if (exclusive) {
-                // Verify no other consumers on this queue
-                boolean hasOtherConsumers = consumers.values().stream()
+                // Verify no other consumers on this queue in this channel
+                boolean hasOtherConsumers = consumerContainer.getConsumersByChannel(channelId).stream()
                     .anyMatch(c -> c.getQueueName().equals(queueName));
                 if (hasOtherConsumers) {
                     throw new AmqpException(AmqpException.Codes.ACCESS_REFUSED, 
@@ -275,13 +281,15 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 }
             }
             
-            log.info("Creating consumer: tag={}, queue={}, noAck={}, exclusive={}", 
-                actualConsumerTag, queueName, noAck, exclusive);
+            log.info("Creating consumer: tag={}, queue={}, noAck={}, exclusive={}, channel={}", 
+                actualConsumerTag, queueName, noAck, exclusive, channelId);
             
             // Create consumer instance
             Consumer consumer = new Consumer(actualConsumerTag, queueName, this, 
                 noLocal, noAck, exclusive, arguments);
-            consumers.put(actualConsumerTag, consumer);
+            
+            // Add to container for statistics and management
+            consumerContainer.addConsumer(consumer);
             
             // Start consuming from Kafka using ConsumeService
             if (connection.getConsumeService() != null) {
@@ -305,7 +313,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         process(() -> {
             String tag = AMQShortString.toString(consumerTag);
             
-            Consumer consumer = consumers.remove(tag);
+            // Remove from container
+            Consumer consumer = consumerContainer.removeConsumer(tag);
             if (consumer != null) {
                 // Mark consumer as cancelled
                 consumer.cancel();
@@ -315,7 +324,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                     connection.getConsumeService().stopConsuming(tag);
                 }
                 
-                log.info("Consumer {} cancelled for queue {}", tag, consumer.getQueueName());
+                log.info("Consumer {} cancelled for queue {} on channel {}", 
+                    tag, consumer.getQueueName(), channelId);
             } else {
                 log.warn("Attempted to cancel unknown consumer: {}", tag);
             }
@@ -432,6 +442,30 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     public void receiveBasicAck(long deliveryTag, boolean multiple) {
         process(() -> {
             log.debug("Received basic.ack: deliveryTag={}, multiple={}", deliveryTag, multiple);
+            
+            // Acknowledge to Kafka Share Consumer for manual ack
+            if (connection.getConsumeService() instanceof com.aok.core.storage.KafkaConsumeService) {
+                com.aok.core.storage.KafkaConsumeService kafkaService = 
+                    (com.aok.core.storage.KafkaConsumeService) connection.getConsumeService();
+                
+                if (multiple) {
+                    // Acknowledge all messages up to and including this delivery tag
+                    deliveryTagToLocation.entrySet().stream()
+                        .filter(entry -> entry.getKey() <= deliveryTag)
+                        .forEach(entry -> {
+                            MessageLocation loc = entry.getValue();
+                            kafkaService.acknowledgeMessage(loc.consumerTag, loc.topic, loc.partition, loc.offset);
+                            deliveryTagToLocation.remove(entry.getKey());
+                        });
+                } else {
+                    // Acknowledge single message
+                    MessageLocation loc = deliveryTagToLocation.remove(deliveryTag);
+                    if (loc != null) {
+                        kafkaService.acknowledgeMessage(loc.consumerTag, loc.topic, loc.partition, loc.offset);
+                    }
+                }
+            }
+            
             int count = unacknowledgedMessageMap.acknowledge(deliveryTag, multiple);
             log.info("Acknowledged {} message(s)", count);
         });
@@ -506,15 +540,17 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
      * Cancels all active consumers on this channel
      */
     private void cancelAllConsumers() {
-        if (!consumers.isEmpty()) {
-            log.info("Cancelling {} consumers on channel {}", consumers.size(), channelId);
-            consumers.values().forEach(consumer -> {
+        Collection<Consumer> channelConsumers = consumerContainer.getConsumersByChannel(channelId);
+        if (!channelConsumers.isEmpty()) {
+            log.info("Cancelling {} consumers on channel {}", channelConsumers.size(), channelId);
+            channelConsumers.forEach(consumer -> {
                 consumer.cancel();
                 if (connection.getConsumeService() != null) {
                     connection.getConsumeService().stopConsuming(consumer.getConsumerTag());
                 }
             });
-            consumers.clear();
+            // Remove all consumers for this channel from container
+            consumerContainer.removeConsumersByChannel(channelId);
         }
     }
     
@@ -611,15 +647,33 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 unacknowledgedMessageMap.addMessage(deliveryTag, 
                     new UnacknowledgedMessageMap.MessageMetadata(consumer.getQueueName()));
                 
-                // Note: KafkaAckService tracking of deliveryTag to Kafka record mapping
-                // is handled separately in the ack service when messages are acknowledged
+                // Track Kafka message location for manual ack
+                deliveryTagToLocation.put(deliveryTag, 
+                    new MessageLocation(consumer.getConsumerTag(), topic, partition, offset));
             }
             
-            log.debug("Delivered message to consumer {}: deliveryTag={}, bodySize={}", 
-                consumer.getConsumerTag(), deliveryTag, bodySize);
+            log.debug("Delivered message to consumer {}: deliveryTag={}, bodySize={}, noAck={}", 
+                consumer.getConsumerTag(), deliveryTag, bodySize, consumer.isNoAck());
             
         } catch (Exception e) {
             log.error("Failed to deliver message to consumer {}", consumer.getConsumerTag(), e);
+        }
+    }
+    
+    /**
+     * Helper class to track Kafka message location for manual acknowledgment
+     */
+    private static class MessageLocation {
+        final String consumerTag;
+        final String topic;
+        final int partition;
+        final long offset;
+        
+        MessageLocation(String consumerTag, String topic, int partition, long offset) {
+            this.consumerTag = consumerTag;
+            this.topic = topic;
+            this.partition = partition;
+            this.offset = offset;
         }
     }
     

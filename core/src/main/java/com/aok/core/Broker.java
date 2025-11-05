@@ -88,10 +88,16 @@ public class Broker {
         IStorage storage = new KafkaMessageStorage(new ProducerPool());
         ProduceService produceService = new ProduceService(storage);
         
+        // Create consumer container for statistics and management
+        ConsumerContainer consumerContainer = new ConsumerContainer();
+        
         // Create Kafka consumer configuration for ConsumeService
         Properties kafkaConsumerConfig = new Properties();
         kafkaConsumerConfig.put("bootstrap.servers", this.amqpConfig.getKafkaBootstrapServers());
-        ConsumeService consumeService = new KafkaConsumeService(kafkaConsumerConfig);
+        KafkaConsumeService consumeService = new KafkaConsumeService(kafkaConsumerConfig, consumerContainer);
+        
+        // Start the consume service polling thread
+        consumeService.start();
         
         MetaContainer metaContainer = new KafkaMetaContainer(this.amqpConfig.getKafkaBootstrapServers());
         metaContainer.start();
@@ -113,7 +119,7 @@ public class Broker {
                 protected void initChannel(SocketChannel socketChannel) {
                     final ChannelPipeline pipeline = socketChannel.pipeline();
                     pipeline.addLast("encoder", new AmqpEncoder());
-                    pipeline.addLast("handler", new AmqpConnection(vhostService, exchangeService, queueService, bindingService, produceService, consumeService));
+                    pipeline.addLast("handler", new AmqpConnection(vhostService, exchangeService, queueService, bindingService, produceService, consumeService, consumerContainer));
                 }
             });
         try {

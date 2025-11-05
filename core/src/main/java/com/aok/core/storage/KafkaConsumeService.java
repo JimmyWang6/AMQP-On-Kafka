@@ -17,13 +17,14 @@
 package com.aok.core.storage;
 
 import com.aok.core.Consumer;
+import com.aok.core.ConsumerContainer;
 import com.aok.core.storage.message.Message;
 import com.aok.core.storage.message.MessageDeserializer;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.KafkaShareConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
 import java.time.Duration;
@@ -31,30 +32,39 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Kafka-based message consumption service using Kafka Share Groups (KIP-932).
- * Each consumer gets messages from a queue using share group semantics,
- * allowing multiple consumers to share consumption of messages.
+ * Uses a single main thread to poll all share consumers for efficiency.
+ * Supports manual acknowledgment for noAck=false consumers.
  */
 @Slf4j
 public class KafkaConsumeService implements ConsumeService {
     
-    private final Map<String, ConsumerTask> activeTasks = new ConcurrentHashMap<>();
-    private final ExecutorService executorService;
+    // Map: consumerTag -> ShareConsumerInfo
+    private final Map<String, ShareConsumerInfo> activeConsumers = new ConcurrentHashMap<>();
     private final Properties kafkaConsumerConfig;
+    private final ConsumerContainer consumerContainer;
+    private final Thread pollingThread;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final Duration pollTimeout = Duration.ofMillis(100);
     
-    public KafkaConsumeService(Properties kafkaConsumerConfig) {
+    public KafkaConsumeService(Properties kafkaConsumerConfig, ConsumerContainer consumerContainer) {
         this.kafkaConsumerConfig = kafkaConsumerConfig;
-        this.executorService = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r);
-            t.setName("kafka-consumer-thread");
-            t.setDaemon(true);
-            return t;
-        });
+        this.consumerContainer = consumerContainer;
+        this.pollingThread = new Thread(this::pollAllConsumers, "kafka-share-consumer-poller");
+        this.pollingThread.setDaemon(true);
+    }
+    
+    /**
+     * Starts the polling thread
+     */
+    public void start() {
+        if (running.compareAndSet(false, true)) {
+            pollingThread.start();
+            log.info("KafkaConsumeService started");
+        }
     }
     
     @Override
@@ -62,7 +72,7 @@ public class KafkaConsumeService implements ConsumeService {
         String consumerTag = consumer.getConsumerTag();
         String queueName = consumer.getQueueName();
         
-        if (activeTasks.containsKey(consumerTag)) {
+        if (activeConsumers.containsKey(consumerTag)) {
             log.warn("Consumer {} is already active, skipping start", consumerTag);
             return;
         }
@@ -70,37 +80,70 @@ public class KafkaConsumeService implements ConsumeService {
         log.info("Starting consumer {} for queue {}", consumerTag, queueName);
         
         // Create Kafka share consumer for this AMQP consumer
-        KafkaConsumer<String, Message> kafkaConsumer = createKafkaConsumer(consumerTag, queueName);
+        KafkaShareConsumer<String, Message> kafkaShareConsumer = createKafkaShareConsumer(consumerTag, queueName);
         
         // Subscribe to the queue topic
         String topic = CommonUtils.generateKey(consumer.getChannel().getConnection().getVhost(), queueName);
-        kafkaConsumer.subscribe(Collections.singletonList(topic));
+        kafkaShareConsumer.subscribe(Collections.singletonList(topic));
         
-        // Create consumer task
-        ConsumerTask task = new ConsumerTask(kafkaConsumer, consumer, messageHandler);
+        // Store consumer info
+        ShareConsumerInfo info = new ShareConsumerInfo(kafkaShareConsumer, consumer, messageHandler);
+        activeConsumers.put(consumerTag, info);
         
-        // Start task and store for management
-        task.future = executorService.submit(task);
-        activeTasks.put(consumerTag, task);
-        
-        log.debug("Consumer {} started successfully", consumerTag);
+        log.debug("Consumer {} started successfully, total active consumers: {}", 
+            consumerTag, activeConsumers.size());
     }
     
     @Override
     public void stopConsuming(String consumerTag) {
-        ConsumerTask task = activeTasks.remove(consumerTag);
-        if (task != null) {
+        ShareConsumerInfo info = activeConsumers.remove(consumerTag);
+        if (info != null) {
             log.info("Stopping consumer {}", consumerTag);
-            task.stop();
+            try {
+                info.kafkaShareConsumer.close();
+                log.debug("Consumer {} stopped, total active consumers: {}", 
+                    consumerTag, activeConsumers.size());
+            } catch (Exception e) {
+                log.error("Error closing Kafka share consumer for {}", consumerTag, e);
+            }
         } else {
-            log.warn("Consumer {} not found in active tasks", consumerTag);
+            log.warn("Consumer {} not found in active consumers", consumerTag);
+        }
+    }
+    
+    /**
+     * Acknowledges a message for manual ack consumers.
+     * This is called when receiveBasicAck is invoked by the AMQP client.
+     * 
+     * @param consumerTag the consumer tag
+     * @param topic the Kafka topic
+     * @param partition the Kafka partition
+     * @param offset the Kafka offset
+     */
+    public void acknowledgeMessage(String consumerTag, String topic, int partition, long offset) {
+        ShareConsumerInfo info = activeConsumers.get(consumerTag);
+        if (info != null) {
+            try {
+                // Acknowledge the specific record in the share group
+                // Note: We create a minimal ConsumerRecord for acknowledgment
+                org.apache.kafka.clients.consumer.ConsumerRecord<String, Message> record = 
+                    new org.apache.kafka.clients.consumer.ConsumerRecord<>(
+                        topic, partition, offset, null, null);
+                info.kafkaShareConsumer.acknowledge(record);
+                log.debug("Acknowledged message for consumer {}: topic={}, partition={}, offset={}", 
+                    consumerTag, topic, partition, offset);
+            } catch (Exception e) {
+                log.error("Failed to acknowledge message for consumer {}", consumerTag, e);
+            }
+        } else {
+            log.warn("Cannot acknowledge - consumer {} not found", consumerTag);
         }
     }
     
     /**
      * Creates a Kafka share consumer for the given consumer tag and queue
      */
-    private KafkaConsumer<String, Message> createKafkaConsumer(String consumerTag, String queueName) {
+    private KafkaShareConsumer<String, Message> createKafkaShareConsumer(String consumerTag, String queueName) {
         Properties props = new Properties();
         props.putAll(kafkaConsumerConfig);
         
@@ -109,91 +152,117 @@ public class KafkaConsumeService implements ConsumeService {
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "share-" + queueName);
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, MessageDeserializer.class.getName());
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); // Manual commit for ack control
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); // Always manual commit for share groups
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         
-        return new KafkaConsumer<>(props);
+        return new KafkaShareConsumer<>(props);
+    }
+    
+    /**
+     * Main polling loop that polls all active share consumers in a single thread
+     */
+    private void pollAllConsumers() {
+        log.info("Kafka share consumer polling thread started");
+        
+        while (running.get()) {
+            try {
+                // Poll each active consumer
+                for (Map.Entry<String, ShareConsumerInfo> entry : activeConsumers.entrySet()) {
+                    String consumerTag = entry.getKey();
+                    ShareConsumerInfo info = entry.getValue();
+                    
+                    if (!info.consumer.isActive()) {
+                        log.debug("Consumer {} is not active, skipping poll", consumerTag);
+                        continue;
+                    }
+                    
+                    try {
+                        // Poll for messages with short timeout
+                        ConsumerRecords<String, Message> records = info.kafkaShareConsumer.poll(pollTimeout);
+                        
+                        for (ConsumerRecord<String, Message> record : records) {
+                            try {
+                                // Deliver message to AMQP client via callback
+                                info.messageHandler.handleMessage(
+                                    record.value(),
+                                    record.topic(),
+                                    record.partition(),
+                                    record.offset()
+                                );
+                                
+                                info.consumer.incrementMessageCount();
+                                
+                                // For auto-ack consumers (noAck=true), acknowledge immediately
+                                if (info.consumer.isNoAck()) {
+                                    info.kafkaShareConsumer.acknowledge(record);
+                                    log.debug("Auto-acknowledged message for consumer {}: offset={}", 
+                                        consumerTag, record.offset());
+                                }
+                                // For manual ack consumers (noAck=false), acknowledgment happens via receiveBasicAck
+                                
+                                log.trace("Delivered message from offset {} to consumer {}", 
+                                    record.offset(), consumerTag);
+                            } catch (Exception e) {
+                                log.error("Error delivering message to consumer {}", consumerTag, e);
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.error("Error polling consumer {}", consumerTag, e);
+                    }
+                }
+                
+                // Small sleep to avoid tight loop when no consumers
+                if (activeConsumers.isEmpty()) {
+                    Thread.sleep(100);
+                }
+            } catch (InterruptedException e) {
+                log.info("Polling thread interrupted");
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                log.error("Error in polling loop", e);
+            }
+        }
+        
+        log.info("Kafka share consumer polling thread stopped");
     }
     
     /**
      * Shuts down the consume service and all active consumers
      */
     public void shutdown() {
-        log.info("Shutting down KafkaConsumeService with {} active consumers", activeTasks.size());
+        log.info("Shutting down KafkaConsumeService with {} active consumers", activeConsumers.size());
         
-        // Stop all active consumers
-        activeTasks.values().forEach(ConsumerTask::stop);
-        activeTasks.clear();
+        // Stop polling thread
+        running.set(false);
+        pollingThread.interrupt();
         
-        // Shutdown executor
-        executorService.shutdown();
+        // Close all active consumers
+        activeConsumers.values().forEach(info -> {
+            try {
+                info.kafkaShareConsumer.close();
+            } catch (Exception e) {
+                log.error("Error closing Kafka share consumer", e);
+            }
+        });
+        activeConsumers.clear();
+        
+        log.info("KafkaConsumeService shutdown complete");
     }
     
     /**
-     * Task that runs in background thread to poll Kafka and deliver messages
+     * Information about an active share consumer
      */
-    private static class ConsumerTask implements Runnable {
-        private final KafkaConsumer<String, Message> kafkaConsumer;
-        private final Consumer amqpConsumer;
-        private final MessageHandler messageHandler;
-        private volatile boolean running = true;
-        private volatile Future<?> future;
+    private static class ShareConsumerInfo {
+        final KafkaShareConsumer<String, Message> kafkaShareConsumer;
+        final Consumer consumer;
+        final MessageHandler messageHandler;
         
-        ConsumerTask(KafkaConsumer<String, Message> kafkaConsumer, Consumer amqpConsumer, 
-                    MessageHandler messageHandler) {
-            this.kafkaConsumer = kafkaConsumer;
-            this.amqpConsumer = amqpConsumer;
+        ShareConsumerInfo(KafkaShareConsumer<String, Message> kafkaShareConsumer, 
+                         Consumer consumer, MessageHandler messageHandler) {
+            this.kafkaShareConsumer = kafkaShareConsumer;
+            this.consumer = consumer;
             this.messageHandler = messageHandler;
-        }
-        
-        @Override
-        public void run() {
-            log.info("Consumer task started for {}", amqpConsumer.getConsumerTag());
-            
-            try {
-                while (running && amqpConsumer.isActive()) {
-                    // Poll for messages with timeout
-                    ConsumerRecords<String, Message> records = kafkaConsumer.poll(Duration.ofMillis(100));
-                    
-                    for (ConsumerRecord<String, Message> record : records) {
-                        if (!running || !amqpConsumer.isActive()) {
-                            break;
-                        }
-                        
-                        try {
-                            // Deliver message to AMQP client via callback
-                            messageHandler.handleMessage(
-                                record.value(), 
-                                record.topic(), 
-                                record.partition(), 
-                                record.offset()
-                            );
-                            
-                            amqpConsumer.incrementMessageCount();
-                            
-                            log.debug("Delivered message from offset {} to consumer {}", 
-                                record.offset(), amqpConsumer.getConsumerTag());
-                        } catch (Exception e) {
-                            log.error("Error delivering message to consumer {}", 
-                                amqpConsumer.getConsumerTag(), e);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                log.error("Consumer task error for {}", amqpConsumer.getConsumerTag(), e);
-            } finally {
-                try {
-                    kafkaConsumer.close();
-                    log.info("Consumer task stopped for {}", amqpConsumer.getConsumerTag());
-                } catch (Exception e) {
-                    log.error("Error closing Kafka consumer", e);
-                }
-            }
-        }
-        
-        void stop() {
-            running = false;
-            kafkaConsumer.wakeup();
         }
     }
 }
