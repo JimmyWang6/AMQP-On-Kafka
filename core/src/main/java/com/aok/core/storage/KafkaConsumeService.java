@@ -76,10 +76,11 @@ public class KafkaConsumeService implements ConsumeService {
         String topic = CommonUtils.generateKey(consumer.getChannel().getConnection().getVhost(), queueName);
         kafkaConsumer.subscribe(Collections.singletonList(topic));
         
-        // Create and start consumer task
+        // Create consumer task
         ConsumerTask task = new ConsumerTask(kafkaConsumer, consumer, messageHandler);
-        Future<?> future = executorService.submit(task);
         
+        // Start task and store for management
+        task.future = executorService.submit(task);
         activeTasks.put(consumerTag, task);
         
         log.debug("Consumer {} started successfully", consumerTag);
@@ -136,6 +137,7 @@ public class KafkaConsumeService implements ConsumeService {
         private final Consumer amqpConsumer;
         private final MessageHandler messageHandler;
         private volatile boolean running = true;
+        private volatile Future<?> future;
         
         ConsumerTask(KafkaConsumer<String, Message> kafkaConsumer, Consumer amqpConsumer, 
                     MessageHandler messageHandler) {

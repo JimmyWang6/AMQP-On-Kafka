@@ -570,7 +570,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 try {
                     properties.setExpiration(Long.parseLong(message.getExpiration()));
                 } catch (NumberFormatException e) {
-                    log.warn("Invalid expiration value: {}", message.getExpiration());
+                    log.warn("Invalid expiration value: {}, skipping expiration property", message.getExpiration());
+                    // Skip setting expiration property if invalid
                 }
             }
             if (message.getMessageId() != null) {
@@ -610,11 +611,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
                 unacknowledgedMessageMap.addMessage(deliveryTag, 
                     new UnacknowledgedMessageMap.MessageMetadata(consumer.getQueueName()));
                 
-                // Register with ack service if available
-                if (unacknowledgedMessageMap != null && connection.getConsumeService() != null) {
-                    // The KafkaAckService needs to track the delivery tag to Kafka record mapping
-                    // This will be done in the ack service initialization
-                }
+                // Note: KafkaAckService tracking of deliveryTag to Kafka record mapping
+                // is handled separately in the ack service when messages are acknowledged
             }
             
             log.debug("Delivered message to consumer {}: deliveryTag={}, bodySize={}", 
