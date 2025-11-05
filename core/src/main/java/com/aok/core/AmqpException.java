@@ -28,6 +28,8 @@ public class AmqpException extends RuntimeException {
         public static final int PRECONDITION_FAILED = 406;
         public static final int NOT_FOUND = 404;
         public static final int INTERNAL_ERROR = 500;
+        public static final int NOT_ALLOWED = 530;
+        public static final int ACCESS_REFUSED = 403;
     }
 }
 

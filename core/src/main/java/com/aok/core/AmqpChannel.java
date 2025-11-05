@@ -18,6 +18,7 @@
  */
 package com.aok.core;
 
+import com.aok.core.storage.ConsumeService;
 import com.aok.core.storage.message.Message;
 import com.aok.meta.Binding;
 import com.aok.meta.Exchange;
@@ -33,6 +34,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.qpid.server.bytebuffer.QpidByteBuffer;
 import org.apache.qpid.server.protocol.v0_8.AMQShortString;
 import org.apache.qpid.server.protocol.v0_8.FieldTable;
+import org.apache.qpid.server.protocol.v0_8.transport.AMQFrame;
 import org.apache.qpid.server.protocol.v0_8.transport.AMQMethodBody;
 import org.apache.qpid.server.protocol.v0_8.transport.AccessRequestOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.BasicContentHeaderProperties;
@@ -43,7 +45,11 @@ import org.apache.qpid.server.protocol.v0_8.transport.QueueDeclareOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.QueueUnbindOkBody;
 import org.apache.qpid.server.protocol.v0_8.transport.ServerChannelMethodProcessor;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 public class AmqpChannel implements ServerChannelMethodProcessor {
@@ -67,6 +73,13 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     // Acknowledgment tracking
     private final UnacknowledgedMessageMap unacknowledgedMessageMap;
     
+    // Consumer tracking - use ConsumerContainer for statistics
+    private final ConsumerContainer consumerContainer;
+    private final AtomicLong consumerTagSequence = new AtomicLong(0);
+    
+    // Message delivery tracking for manual ack: deliveryTag -> (consumerTag, recordRef)
+    private final Map<Long, RecordAckInfo> deliveryTagToRecord = new ConcurrentHashMap<>();
+    
     // Transaction state
     private boolean transactionMode = false;
     
@@ -76,7 +89,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         VhostService vhostService,
         ExchangeService exchangeService,
         QueueService queueService,
-        BindingService bindingService
+        BindingService bindingService,
+        ConsumerContainer consumerContainer
     ) {
         this.connection = connection;
         this.channelId = channelId;
@@ -84,6 +98,7 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
         this.exchangeService = exchangeService;
         this.queueService = queueService;
         this.bindingService = bindingService;
+        this.consumerContainer = consumerContainer;
         // Initialize with null AckService for now - will be set when Kafka integration is complete
         this.unacknowledgedMessageMap = new UnacknowledgedMessageMap(null);
     }
@@ -237,15 +252,88 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Override
     public void receiveBasicConsume(AMQShortString queue, AMQShortString consumerTag, boolean noLocal, boolean noAck, boolean exclusive, boolean nowait, FieldTable arguments) {
         process(() -> {
+            String queueName = AMQShortString.toString(queue);
+            
+            // Validate queue exists
+            Queue q = queueService.getQueue(connection.getVhost(), queueName);
+            if (q == null) {
+                throw new AmqpException(AmqpException.Codes.NOT_FOUND, 
+                    "Queue not found: " + queueName, false);
+            }
+            
+            // Generate consumer tag if not provided
+            String actualConsumerTag = consumerTag != null ? consumerTag.toString() 
+                : "ctag-" + channelId + "-" + consumerTagSequence.incrementAndGet();
+            
+            // Check if consumer tag already exists (use container)
+            if (consumerContainer.containsConsumer(actualConsumerTag)) {
+                throw new AmqpException(AmqpException.Codes.NOT_ALLOWED, 
+                    "Consumer tag already in use: " + actualConsumerTag, false);
+            }
+            
+            // Check exclusive access (check against other consumers in this channel)
+            if (exclusive) {
+                // Verify no other consumers on this queue in this channel
+                boolean hasOtherConsumers = consumerContainer.getConsumersByChannel(channelId).stream()
+                    .anyMatch(c -> c.getQueueName().equals(queueName));
+                if (hasOtherConsumers) {
+                    throw new AmqpException(AmqpException.Codes.ACCESS_REFUSED, 
+                        "Queue has existing consumers, cannot get exclusive access", false);
+                }
+            }
+            
+            log.info("Creating consumer: tag={}, queue={}, noAck={}, exclusive={}, channel={}", 
+                actualConsumerTag, queueName, noAck, exclusive, channelId);
+            
+            // Create consumer instance
+            Consumer consumer = new Consumer(actualConsumerTag, queueName, this, 
+                noLocal, noAck, exclusive, arguments);
+            
+            // Add to container for statistics and management
+            consumerContainer.addConsumer(consumer);
+            
+            // Start consuming from Kafka using ConsumeService
+            if (connection.getConsumeService() != null) {
+                connection.getConsumeService().startConsuming(consumer, 
+                    (message, recordRef) -> deliverMessage(consumer, message, recordRef));
+            } else {
+                log.warn("ConsumeService not available, consumer {} will not receive messages", actualConsumerTag);
+            }
+            
+            // Send consume-ok response
             final AMQMethodBody responseBody = connection.getRegistry().createBasicConsumeOkBody(
-                AMQShortString.createAMQShortString("ctag"));
+                AMQShortString.createAMQShortString(actualConsumerTag));
             connection.writeFrame(responseBody.generateFrame(channelId));
+            
+            log.debug("Consumer {} started successfully for queue {}", actualConsumerTag, queueName);
         });
     }
 
     @Override
     public void receiveBasicCancel(AMQShortString consumerTag, boolean noWait) {
-        connection.writeFrame(connection.getRegistry().createBasicCancelOkBody(consumerTag).generateFrame(channelId));
+        process(() -> {
+            String tag = AMQShortString.toString(consumerTag);
+            
+            // Remove from container
+            Consumer consumer = consumerContainer.removeConsumer(tag);
+            if (consumer != null) {
+                // Mark consumer as cancelled
+                consumer.cancel();
+                
+                // Stop consuming from backend
+                if (connection.getConsumeService() != null) {
+                    connection.getConsumeService().stopConsuming(tag);
+                }
+                
+                log.info("Consumer {} cancelled for queue {} on channel {}", 
+                    tag, consumer.getQueueName(), channelId);
+            } else {
+                log.warn("Attempted to cancel unknown consumer: {}", tag);
+            }
+            
+            // Send cancel-ok response
+            connection.writeFrame(connection.getRegistry().createBasicCancelOkBody(consumerTag).generateFrame(channelId));
+        });
     }
 
     @Override
@@ -278,6 +366,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     public void receiveChannelClose(int replyCode, AMQShortString replyText, int classId, int methodId) {
         log.info("Received channel.close: code={}, text={}, classId={}, methodId={}", 
             replyCode, replyText, classId, methodId);
+        // Cancel all consumers
+        cancelAllConsumers();
         // Clear unacknowledged messages
         unacknowledgedMessageMap.clear();
         // Send close-ok response
@@ -289,6 +379,8 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     @Override
     public void receiveChannelCloseOk() {
         log.info("Received channel.close-ok for channel {}", channelId);
+        // Cancel all consumers
+        cancelAllConsumers();
         // Clear unacknowledged messages
         unacknowledgedMessageMap.clear();
         connection.closeChannel(this);
@@ -351,6 +443,28 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
     public void receiveBasicAck(long deliveryTag, boolean multiple) {
         process(() -> {
             log.debug("Received basic.ack: deliveryTag={}, multiple={}", deliveryTag, multiple);
+            
+            // Acknowledge to Kafka Share Consumer for manual ack
+            ConsumeService consumeService = connection.getConsumeService();
+            if (consumeService != null) {
+                if (multiple) {
+                    // Acknowledge all messages up to and including this delivery tag
+                    deliveryTagToRecord.entrySet().stream()
+                        .filter(entry -> entry.getKey() <= deliveryTag)
+                        .forEach(entry -> {
+                            RecordAckInfo info = entry.getValue();
+                            consumeService.acknowledgeRecord(info.consumerTag, info.recordRef);
+                            deliveryTagToRecord.remove(entry.getKey());
+                        });
+                } else {
+                    // Acknowledge single message
+                    RecordAckInfo info = deliveryTagToRecord.remove(deliveryTag);
+                    if (info != null) {
+                        consumeService.acknowledgeRecord(info.consumerTag, info.recordRef);
+                    }
+                }
+            }
+            
             int count = unacknowledgedMessageMap.acknowledge(deliveryTag, multiple);
             log.info("Acknowledged {} message(s)", count);
         });
@@ -415,6 +529,154 @@ public class AmqpChannel implements ServerChannelMethodProcessor {
 
     public void closeChannel(int cause, final String message) {
         connection.closeChannelAndWriteFrame(this, cause, message);
+    }
+    
+    public AmqpConnection getConnection() {
+        return connection;
+    }
+    
+    /**
+     * Cancels all active consumers on this channel
+     */
+    private void cancelAllConsumers() {
+        Collection<Consumer> channelConsumers = consumerContainer.getConsumersByChannel(channelId);
+        if (!channelConsumers.isEmpty()) {
+            log.info("Cancelling {} consumers on channel {}", channelConsumers.size(), channelId);
+            channelConsumers.forEach(consumer -> {
+                consumer.cancel();
+                if (connection.getConsumeService() != null) {
+                    connection.getConsumeService().stopConsuming(consumer.getConsumerTag());
+                }
+            });
+            // Remove all consumers for this channel from container
+            consumerContainer.removeConsumersByChannel(channelId);
+        }
+    }
+    
+    /**
+     * Delivers a message from Kafka to the AMQP consumer
+     * 
+     * @param consumer the consumer to deliver to
+     * @param message the message to deliver
+     * @param recordRef reference to the backend record (for acknowledgment)
+     */
+    private void deliverMessage(Consumer consumer, Message message, Object recordRef) {
+        try {
+            // Generate delivery tag
+            long deliveryTag = unacknowledgedMessageMap.generateDeliveryTag();
+            
+            // Convert Message to AMQP frames
+            AMQShortString consumerTagShortString = AMQShortString.createAMQShortString(consumer.getConsumerTag());
+            AMQShortString exchangeShortString = AMQShortString.createAMQShortString(message.getExchange());
+            AMQShortString routingKeyShortString = AMQShortString.createAMQShortString(message.getRoutingKey());
+            
+            // Create BasicDeliver method frame
+            AMQMethodBody deliverBody = connection.getRegistry().createBasicDeliverBody(
+                consumerTagShortString,
+                deliveryTag,
+                false, // redelivered - could be tracked later
+                exchangeShortString,
+                routingKeyShortString
+            );
+            
+            // Create content header with properties
+            BasicContentHeaderProperties properties = new BasicContentHeaderProperties();
+            if (message.getContentType() != null) {
+                properties.setContentType(message.getContentType());
+            }
+            if (message.getContentEncoding() != null) {
+                properties.setEncoding(message.getContentEncoding());
+            }
+            if (message.getDeliveryMode() > 0) {
+                properties.setDeliveryMode((byte) ((int) message.getDeliveryMode()));
+            }
+            if (message.getPriority() > 0) {
+                properties.setPriority((byte) ((int) message.getPriority()));
+            }
+            if (message.getCorrelationId() != null) {
+                properties.setCorrelationId(AMQShortString.createAMQShortString(message.getCorrelationId()));
+            }
+            if (message.getReplyTo() != null) {
+                properties.setReplyTo(AMQShortString.createAMQShortString(message.getReplyTo()));
+            }
+            if (message.getExpiration() != null) {
+                try {
+                    properties.setExpiration(Long.parseLong(message.getExpiration()));
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid expiration value: {}, skipping expiration property", message.getExpiration());
+                    // Skip setting expiration property if invalid
+                }
+            }
+            if (message.getMessageId() != null) {
+                properties.setMessageId(AMQShortString.createAMQShortString(message.getMessageId()));
+            }
+            if (message.getTimestamp() > 0) {
+                properties.setTimestamp(message.getTimestamp());
+            }
+            if (message.getType() != null) {
+                properties.setType(AMQShortString.createAMQShortString(message.getType()));
+            }
+            if (message.getUserId() != null) {
+                properties.setUserId(AMQShortString.createAMQShortString(message.getUserId()));
+            }
+            if (message.getAppId() != null) {
+                properties.setAppId(AMQShortString.createAMQShortString(message.getAppId()));
+            }
+            
+            long bodySize = message.getBodySize();
+            ContentHeaderBody contentHeader = new ContentHeaderBody(properties, bodySize);
+            
+            // Write deliver method frame
+            connection.writeFrame(deliverBody.generateFrame(channelId));
+            
+            // Write content header frame
+            connection.writeFrame(new AMQFrame(channelId, contentHeader));
+            
+            // Write content body frame(s)
+            if (bodySize > 0 && message.getBody() != null) {
+                QpidByteBuffer bodyBuffer = QpidByteBuffer.wrap(message.getBody());
+                ContentBody contentBody = new ContentBody(bodyBuffer);
+                connection.writeFrame(new AMQFrame(channelId, contentBody));
+            }
+            
+            // Handle acknowledgment based on noAck flag
+            if (consumer.isNoAck()) {
+                // For auto-ack consumers (noAck=true), acknowledge immediately
+                ConsumeService consumeService = connection.getConsumeService();
+                if (consumeService != null) {
+                    consumeService.acknowledgeRecord(consumer.getConsumerTag(), recordRef);
+                    log.debug("Auto-acknowledged message for consumer {}: deliveryTag={}", 
+                        consumer.getConsumerTag(), deliveryTag);
+                }
+            } else {
+                // For manual-ack consumers (noAck=false), track for later acknowledgment
+                unacknowledgedMessageMap.addMessage(deliveryTag, 
+                    new UnacknowledgedMessageMap.MessageMetadata(consumer.getQueueName()));
+                
+                // Track record reference for manual ack
+                deliveryTagToRecord.put(deliveryTag, 
+                    new RecordAckInfo(consumer.getConsumerTag(), recordRef));
+                
+                log.debug("Delivered message to consumer {}: deliveryTag={}, bodySize={}, waiting for manual ack", 
+                    consumer.getConsumerTag(), deliveryTag, bodySize);
+            }
+            
+        } catch (Exception e) {
+            log.error("Failed to deliver message to consumer {}", consumer.getConsumerTag(), e);
+        }
+    }
+    
+    /**
+     * Helper class to track record reference for manual acknowledgment
+     */
+    private static class RecordAckInfo {
+        final String consumerTag;
+        final Object recordRef;
+        
+        RecordAckInfo(String consumerTag, Object recordRef) {
+            this.consumerTag = consumerTag;
+            this.recordRef = recordRef;
+        }
     }
     
     /**
