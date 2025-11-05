@@ -152,7 +152,8 @@ public class KafkaConsumeService implements ConsumeService {
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "share-" + queueName);
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, MessageDeserializer.class.getName());
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); // Always manual commit for share groups
+        // Disable auto-commit - we use manual acknowledgment for both auto-ack and manual-ack consumers
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         
         return new KafkaShareConsumer<>(props);
@@ -166,8 +167,12 @@ public class KafkaConsumeService implements ConsumeService {
         
         while (running.get()) {
             try {
+                // Create a snapshot of active consumers to avoid ConcurrentModificationException
+                // when consumers are added/removed by other threads
+                Map<String, ShareConsumerInfo> snapshot = new java.util.HashMap<>(activeConsumers);
+                
                 // Poll each active consumer
-                for (Map.Entry<String, ShareConsumerInfo> entry : activeConsumers.entrySet()) {
+                for (Map.Entry<String, ShareConsumerInfo> entry : snapshot.entrySet()) {
                     String consumerTag = entry.getKey();
                     ShareConsumerInfo info = entry.getValue();
                     
