@@ -16,6 +16,7 @@
  */
 package com.aok.core;
 
+import com.aok.core.storage.ConsumeService;
 import com.aok.core.storage.ProduceService;
 import com.aok.meta.service.BindingService;
 import com.aok.meta.service.ExchangeService;
@@ -68,6 +69,8 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
 
     private final ProduceService storage;
     
+    private final ConsumeService consumeService;
+    
     private final ConcurrentHashMap<Integer, AmqpChannel> channels = new ConcurrentHashMap<>();
 
     @Getter
@@ -85,12 +88,13 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     
     private volatile boolean closed = false;
 
-    AmqpConnection(VhostService vhostService, ExchangeService exchangeService, QueueService queueService, BindingService bindingService, ProduceService produceService) {
+    AmqpConnection(VhostService vhostService, ExchangeService exchangeService, QueueService queueService, BindingService bindingService, ProduceService produceService, ConsumeService consumeService) {
         this.vhostService = vhostService;
         this.exchangeService = exchangeService;
         this.queueService = queueService;
         this.bindingService = bindingService;
         this.storage = produceService;
+        this.consumeService = consumeService;
     }
 
     @Getter
@@ -275,6 +279,10 @@ public class AmqpConnection extends AmqpCommandDecoder implements ServerMethodPr
     
     public ProduceService getStorage() {
         return storage;
+    }
+    
+    public ConsumeService getConsumeService() {
+        return consumeService;
     }
 
     public void sendConnectionClose(int errorCode, String message, int channelId) {

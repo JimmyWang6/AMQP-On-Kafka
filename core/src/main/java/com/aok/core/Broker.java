@@ -17,7 +17,9 @@
 package com.aok.core;
 
 import com.aok.core.config.AmqpConfig;
+import com.aok.core.storage.ConsumeService;
 import com.aok.core.storage.IStorage;
+import com.aok.core.storage.KafkaConsumeService;
 import com.aok.core.storage.KafkaMessageStorage;
 import com.aok.core.storage.ProduceService;
 import com.aok.core.storage.ProducerPool;
@@ -85,6 +87,12 @@ public class Broker {
         ServerBootstrap serverBootstrap = new ServerBootstrap();
         IStorage storage = new KafkaMessageStorage(new ProducerPool());
         ProduceService produceService = new ProduceService(storage);
+        
+        // Create Kafka consumer configuration for ConsumeService
+        Properties kafkaConsumerConfig = new Properties();
+        kafkaConsumerConfig.put("bootstrap.servers", this.amqpConfig.getKafkaBootstrapServers());
+        ConsumeService consumeService = new KafkaConsumeService(kafkaConsumerConfig);
+        
         MetaContainer metaContainer = new KafkaMetaContainer(this.amqpConfig.getKafkaBootstrapServers());
         metaContainer.start();
         VhostService vhostService = new VhostService(metaContainer);
@@ -105,7 +113,7 @@ public class Broker {
                 protected void initChannel(SocketChannel socketChannel) {
                     final ChannelPipeline pipeline = socketChannel.pipeline();
                     pipeline.addLast("encoder", new AmqpEncoder());
-                    pipeline.addLast("handler", new AmqpConnection(vhostService, exchangeService, queueService, bindingService, produceService));
+                    pipeline.addLast("handler", new AmqpConnection(vhostService, exchangeService, queueService, bindingService, produceService, consumeService));
                 }
             });
         try {
